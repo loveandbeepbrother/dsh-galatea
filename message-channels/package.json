@@ -1,0 +1,109 @@
+{
+    "name": "@loveandbeepbrother/dsh-galatea-channels",
+    "version": "0.1.0-preview.4",
+    "description": "Galatea message channels: talk to your assistant from QQ (official bot) and WeChat; other chat apps plug in as platforms through registerPlatform. Replies follow the framework's routing, quiet hours hold non-urgent messages. 经 QQ、微信和助手说话，别的聊天软件可以接进来。",
+    "keywords": [
+        "dsh-plugin",
+        "dsh",
+        "deepseek-harness",
+        "qq",
+        "wechat",
+        "weixin",
+        "chat",
+        "galatea"
+    ],
+    "license": "MIT",
+    "homepage": "https://github.com/loveandbeepbrother/dsh-galatea/tree/main/message-channels#readme",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/loveandbeepbrother/dsh-galatea.git",
+        "directory": "message-channels"
+    },
+    "bugs": {
+        "url": "https://github.com/loveandbeepbrother/dsh-galatea/issues"
+    },
+    "type": "module",
+    "main": "./index.js",
+    "exports": {
+        ".": "./index.js",
+        "./media": "./media.js",
+        "./client": "./client.js",
+        "./channel-ingress": "./channel-ingress.js",
+        "./package.json": "./package.json"
+    },
+    "files": [
+        "index.js",
+        "channel-ingress.js",
+        "routes.js",
+        "runtime.js",
+        "replies.js",
+        "media.js",
+        "compose.js",
+        "lease.js",
+        "client.js",
+        "quota-notices.js",
+        "platforms/",
+        "cordis.patch.yml",
+        "README.md",
+        "THIRD_PARTY_NOTICES.md",
+        "licenses/",
+        "LICENSE"
+    ],
+    "engines": {
+        "node": ">=24.9.0",
+        "dsh": ">=0.2.2-rc.1 <0.3.0-0"
+    },
+    "dsh": {
+        "bundle": {
+            "patch": "./cordis.patch.yml"
+        },
+        "client": {
+            "platform": "web",
+            "inject": [
+                "@deepseek-ai/dsh-client-ui-settings"
+            ]
+        }
+    },
+    "scripts": {
+        "test": "node --test test/*.test.mjs"
+    },
+    "dependencies": {
+        "@tencent-connect/qqbot-connector": "1.2.0",
+        "@tencent-connect/qqbot-nodejs": "1.0.5",
+        "qrcode": "1.5.4",
+        "sharp": "0.35.5",
+        "silk-wasm": "3.7.1",
+        "zod": "4.4.3"
+    },
+    "devDependencies": {
+        "@deepseek-ai/cordis": ">=4.0.5",
+        "@deepseek-ai/dsh-api-session-controller": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-client-ui-primitives": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-client-ui-settings": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-credentials": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-home-paths": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-session": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-session-query": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-storage-domain": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/schemastery": ">=3.18.5",
+        "react": "^18.3.1"
+    },
+    "peerDependencies": {
+        "@loveandbeepbrother/dsh-galatea": ">=0.1.0-preview.0 <0.2.0",
+        "@deepseek-ai/cordis": ">=4.0.5",
+        "@deepseek-ai/dsh-api-session-controller": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-credentials": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-home-paths": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-session": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-session-query": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-storage-domain": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/schemastery": ">=3.18.5"
+    },
+    "publishConfig": {
+        "access": "public"
+    }
+}

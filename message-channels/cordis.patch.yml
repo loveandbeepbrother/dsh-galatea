@@ -1,0 +1,11 @@
+# The one row this bundle contributes to the profile.
+#
+# Only an `insert` of the Host plugin itself: the row names the package, and the
+# package's own `name`/`inject`/`apply` exports decide what activating it does.
+# No settings rows, no web-server rows and no second service - the routes are
+# registered on the official Connection surface from inside `apply`.
+# Galatea 的消息渠道：装上就启用；配对 QQ 官方机器人、微信在插件详情页里做。
+# 别的聊天软件由插件经服务 assistantChannels 的 registerPlatform 接进来（见 README“接新平台”）。
+- insert:
+    - id: message-channels-framework
+      name: '@loveandbeepbrother/dsh-galatea-channels'

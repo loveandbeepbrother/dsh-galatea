@@ -1,0 +1,74 @@
+{
+    "name": "@loveandbeepbrother/dsh-galatea-agent-sdk",
+    "version": "0.1.0-preview.4",
+    "description": "Galatea executor built on the Claude Agent SDK: runs DSH sessions through the local Claude Code, with framework tools exposed over MCP, context handoff, and quota handling. Requires an explicit auth choice (API key recommended). 经 Claude Agent SDK 跑 DSH 会话。",
+    "keywords": [
+        "dsh-plugin",
+        "dsh",
+        "deepseek-harness",
+        "claude-agent-sdk",
+        "galatea"
+    ],
+    "license": "MIT",
+    "homepage": "https://github.com/loveandbeepbrother/dsh-galatea/tree/main/agent-sdk#readme",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/loveandbeepbrother/dsh-galatea.git",
+        "directory": "agent-sdk"
+    },
+    "bugs": {
+        "url": "https://github.com/loveandbeepbrother/dsh-galatea/issues"
+    },
+    "type": "module",
+    "main": "./index.js",
+    "exports": {
+        ".": "./index.js",
+        "./package.json": "./package.json"
+    },
+    "files": [
+        "index.js",
+        "adapter.js",
+        "plan.js",
+        "quota.js",
+        "transcript.js",
+        "cordis.patch.yml",
+        "README.md",
+        "LICENSE"
+    ],
+    "engines": {
+        "node": ">=24.9.0",
+        "dsh": ">=0.2.2-rc.1 <0.3.0-0"
+    },
+    "dsh": {
+        "bundle": {
+            "patch": "./cordis.patch.yml"
+        }
+    },
+    "scripts": {
+        "test": "node --test test/*.test.mjs"
+    },
+    "dependencies": {
+        "@anthropic-ai/claude-agent-sdk": "~0.3.312",
+        "zod": "4.4.3"
+    },
+    "devDependencies": {
+        "@deepseek-ai/cordis": ">=4.0.5",
+        "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-storage-domain": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-subprocess": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/schemastery": ">=3.18.5"
+    },
+    "peerDependencies": {
+        "@loveandbeepbrother/dsh-galatea": ">=0.1.0-preview.0 <0.2.0",
+        "@deepseek-ai/cordis": ">=4.0.5",
+        "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-storage-domain": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-subprocess": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/schemastery": ">=3.18.5"
+    },
+    "publishConfig": {
+        "access": "public"
+    }
+}

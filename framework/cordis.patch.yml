@@ -1,0 +1,27 @@
+# Galatea：记忆与人格框架。各模块是独立的插件入口，装上就启用；不要哪个，在 profile 里按 id 写 `disabled: true`。
+# 休息时段默认 00:00–08:00、本机时区；改的话在 profile 里给 mind-framework-core 写 quietHours。
+- insert:
+    - id: mind-framework-core
+      name: '@loveandbeepbrother/dsh-galatea/core'
+    - id: mind-framework-context
+      name: '@loveandbeepbrother/dsh-galatea/context'
+    - id: mind-framework-compaction
+      name: '@loveandbeepbrother/dsh-galatea/context/engine'
+    - id: mind-framework-mind
+      name: '@loveandbeepbrother/dsh-galatea/mind'
+    - id: mind-framework-embedder
+      name: '@loveandbeepbrother/dsh-galatea/embedder'
+    - id: mind-framework-memory
+      name: '@loveandbeepbrother/dsh-galatea/memory'
+    - id: mind-framework-experience
+      name: '@loveandbeepbrother/dsh-galatea/experience'
+    - id: mind-framework-reflection
+      name: '@loveandbeepbrother/dsh-galatea/reflection'
+    - id: mind-framework-work
+      name: '@loveandbeepbrother/dsh-galatea/work'
+    - id: mind-framework-external
+      name: '@loveandbeepbrother/dsh-galatea/external'
+
+# 原生会话的压缩由框架的压缩引擎接管。这里只停用顶层这一行；web 预设里各带的那一份够不到，引擎在运行时接管（见 context/engine.js）。
+- id: compaction-basic
+  disabled: true

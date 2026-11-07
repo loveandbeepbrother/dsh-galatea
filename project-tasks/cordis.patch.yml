@@ -1,0 +1,4 @@
+# Galatea 的项目任务：中枢把任务派给 DSH 项目，项目里的会话做完把报告交回中枢验收。装上就启用。
+- insert:
+    - id: project-tasks-framework
+      name: '@loveandbeepbrother/dsh-galatea-project-tasks'

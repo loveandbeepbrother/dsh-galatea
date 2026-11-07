@@ -1,0 +1,6 @@
+# Galatea 的 Agent SDK 执行方：注册 agent-sdk 模型提供方，会话经 Claude Agent SDK 交给本机的 Claude Code 跑。
+# 登录方式没有默认值：要在 profile 里给 agent-sdk-executor 写 auth（api-key 并在 env 里给 ANTHROPIC_API_KEY，或 existing-login），
+# 没写时每一轮都会失败并写明怎么改。默认用本包依赖装的 Agent SDK、会话没有工作目录时用主目录；要改就写 sdkEntry、defaultCwd、env。
+- insert:
+    - id: agent-sdk-executor
+      name: '@loveandbeepbrother/dsh-galatea-agent-sdk'

@@ -1,0 +1,72 @@
+{
+    "name": "@loveandbeepbrother/dsh-galatea-project-tasks",
+    "version": "0.1.0-preview.4",
+    "description": "Galatea project tasks: the hub session hands tasks to DSH project workspaces, the assistant there works them through, and reports come back to the hub for review. 中枢派任务给项目、收回报告验收。",
+    "keywords": [
+        "dsh-plugin",
+        "dsh",
+        "deepseek-harness",
+        "projects",
+        "tasks",
+        "delegation",
+        "galatea"
+    ],
+    "license": "MIT",
+    "homepage": "https://github.com/loveandbeepbrother/dsh-galatea/tree/main/project-tasks#readme",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/loveandbeepbrother/dsh-galatea.git",
+        "directory": "project-tasks"
+    },
+    "bugs": {
+        "url": "https://github.com/loveandbeepbrother/dsh-galatea/issues"
+    },
+    "type": "module",
+    "main": "./index.js",
+    "exports": {
+        ".": "./index.js",
+        "./package.json": "./package.json"
+    },
+    "files": [
+        "index.js",
+        "tasks.js",
+        "cordis.patch.yml",
+        "README.md",
+        "LICENSE"
+    ],
+    "engines": {
+        "node": ">=24.9.0",
+        "dsh": ">=0.2.2-rc.1 <0.3.0-0"
+    },
+    "dsh": {
+        "bundle": {
+            "patch": "./cordis.patch.yml"
+        }
+    },
+    "scripts": {
+        "test": "node --test test/*.test.mjs"
+    },
+    "dependencies": {
+        "zod": "4.4.3"
+    },
+    "devDependencies": {
+        "@deepseek-ai/cordis": ">=4.0.5",
+        "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-session": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-storage-domain": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/schemastery": ">=3.18.5"
+    },
+    "peerDependencies": {
+        "@loveandbeepbrother/dsh-galatea": ">=0.1.0-preview.0 <0.2.0",
+        "@deepseek-ai/cordis": ">=4.0.5",
+        "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-session": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-storage-domain": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0-0",
+        "@deepseek-ai/schemastery": ">=3.18.5"
+    },
+    "publishConfig": {
+        "access": "public"
+    }
+}

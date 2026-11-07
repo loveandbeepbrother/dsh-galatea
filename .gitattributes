@@ -1,0 +1,3 @@
+# 工作区和导出都用 LF：同一个提交在哪打包都是同样的字节，脚本的 shebang 也不带 CR。
+* text=auto eol=lf
+*.png binary
