@@ -1293,11 +1293,19 @@ export async function createWeixinPlatform(options = {}) {
 
 /**
  * 发送能力（渠道运行态按它选路，不看平台名）：文字、图片、文件（没有语音消息，语音按音频文件发）；
- * 现在能不能主动发给这个对话——对方最近一条消息的上下文 24 小时内有效。
+ * 现在能不能主动发给这个对话——对方最近一条消息的上下文 24 小时内有效，而且一条消息最多回 10 片：
+ * 第 11 片起平台一律拒收，隔十来分钟再发也一样，所以不是频率限制。
  */
 export const WEIXIN_DELIVERY = Object.freeze({
     sends: Object.freeze(['text', 'image', 'file']),
-    canDeliverNow: ({ live, lastInputAt, now }) => live === true && lastInputAt !== null && now - lastInputAt <= CONTEXT_WINDOW_MS,
+    holdsUntilNextMessage: true,
+    replyLimit: 10,
+    replyLimitLabel: '微信',
+    replyWindowMs: CONTEXT_WINDOW_MS,
+    // 10 只是数出来的数：平台拒收了就算这条消息回不了了，不靠计数。
+    rejectEndsReplies: true,
+    canDeliverNow: ({ live, lastInputAt, now, repliesLeft, repliesNeeded = 1 }) => live === true && lastInputAt !== null
+        && now - lastInputAt <= CONTEXT_WINDOW_MS && repliesLeft >= Math.max(repliesNeeded, 1),
 });
 
 export default createWeixinPlatform;

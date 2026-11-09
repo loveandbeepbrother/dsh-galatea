@@ -18,7 +18,7 @@ import { defineDomain } from '@deepseek-ai/dsh-storage-domain'
 import { z } from 'zod'
 
 /** 存起来的角色；`subagent` 现算、不存。 */
-export const STORED_ROLES = Object.freeze(['hub', 'worker', 'background', 'external'])
+export const STORED_ROLES = Object.freeze(['hub', 'worker', 'background', 'tidy', 'external'])
 export const ROLES = Object.freeze([...STORED_ROLES, 'subagent'])
 
 const roleSchema = z.enum(STORED_ROLES)

@@ -23,6 +23,15 @@ export function ulid(now = Date.now(), random = randomBytes(16)) {
     return time + tail
 }
 
+/** ULID 里的生成时刻（毫秒）；不是 ULID 返回 `NaN`。 */
+export function ulidTime(id) {
+    const head = String(id ?? '').slice(0, 10).toUpperCase()
+    if (!/^[0-7][0-9A-HJKMNP-TV-Z]{9}$/.test(head)) return Number.NaN
+    let time = 0
+    for (const char of head) time = time * 32 + CROCKFORD.indexOf(char)
+    return time
+}
+
 const SCALAR_KEYS = ['title', 'summary', 'scope', 'project', 'created', 'updated']
 const oneLine = value => String(value ?? '').replace(/\s+/g, ' ').trim()
 
@@ -72,22 +81,26 @@ export function indexLine(memory) {
  * 记忆目录：给定的记忆（已经按范围筛好）按最近更新列出，超过 `limit` 字就截断并注明。
  * @returns 目录正文；一条都没有时是空串。
  */
-export function indexText(memories, limit) {
+/** 目录按最近更新排；在上限内能列出前几条（至少一条）。 */
+export function indexFit(memories, limit) {
     const visible = [...memories].sort((left, right) => String(right.updated ?? '').localeCompare(String(left.updated ?? '')))
-    if (visible.length === 0) return ''
     const head = `具体记忆（共 ${visible.length} 条，按最近更新列出；需要时用 assistant_memory_read 读全文与来源，assistant_memory_search 按关键词查找）：`
-    const lines = [head]
+    const lines = []
     let size = head.length
-    let shown = 0
     for (const memory of visible) {
         const line = indexLine(memory)
-        if (size + line.length > limit && shown > 0) break
+        if (size + line.length > limit && lines.length > 0) break
         lines.push(line)
         size += line.length
-        shown += 1
     }
-    if (shown < visible.length) lines.push(`（另有 ${visible.length - shown} 条较早的记忆未列出，可用关键词检索。）`)
-    return lines.join('\n')
+    return { head, lines, total: visible.length }
+}
+
+export function indexText(memories, limit) {
+    const { head, lines, total } = indexFit(memories, limit)
+    if (total === 0) return ''
+    if (lines.length < total) lines.push(`（另有 ${total - lines.length} 条较早的记忆未列出，可用关键词检索。）`)
+    return [head, ...lines].join('\n')
 }
 
 /** 目录里列出的各条：编号 → 那一行。目录是本模块自己写的，按自己的格式拆。 */

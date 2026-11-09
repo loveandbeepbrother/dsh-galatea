@@ -11,7 +11,7 @@ import { pluginRecordOf } from '@deepseek-ai/dsh-session'
 
 import * as ContextModule from '../context/index.js'
 import { BOUNDARY_RECORD, HANDOFF_FAILED_KEY, HANDOFF_LEAD, MindCompactionEngine, SWITCH_LEAD, trimmedRecord } from '../context/engine.js'
-import { RECENT_CUT, RECENT_LEAD, recentTurnsText } from '../context/recent.js'
+import { RECENT_CUT, RECENT_LEAD, RECENT_SENDS_UNREAD, recentTurnsText } from '../context/recent.js'
 import { ROUTE, createUserMessage, makeHarness, waitFor } from './harness.mjs'
 
 /** 测试用的上游压缩配置：小窗口下不留余量、不留尾巴。 */
@@ -301,6 +301,8 @@ test('外部执行方换过新对话以后，DSH 记录里落交接边界：交�
     await writeFile(doc, '进行中：第三章，写到一半。')
     assert.deepEqual(await h.ctx.context.handoff('main', doc), { scheduled: true })
     await waitFor(async () => (await compactions()).length === 1, '边界落下')
+    // 插件记录在压缩结束之后才写。
+    await waitFor(async () => (await boundaries(h, 'main')).length === 1, '边界的记录写下')
     const [record] = await boundaries(h, 'main')
     assert.equal(record.kind, 'handoff')
     assert.equal(record.executor, 'external')
@@ -541,4 +543,37 @@ test('裁剪的记录：最近一份边界整份留着，快照不放，放不�
     assert.ok(!text.includes('快照') && !text.includes('系统'))
     assert.match(text, /更早的 1 条省略了，原文在经历库/)
     assert.ok(text.endsWith('[assistant]\n新的'))
+})
+
+test('交接带的原文：中途发到手机的话按时间并进所属的一轮；[不发] 只去掉最终回复；截止点之后、第一轮之前的不收', () => {
+    const said = (id, text, time) => ({ type: 'user/message', time, data: { id, role: 'user', source: { kind: 'user', speaker: { kind: 'user' } }, content: [{ type: 'text', text }] } })
+    const replied = (turn, text, time) => ({ type: 'assistant/message', time, data: { turn, message: { content: [{ type: 'text', text }] } } })
+    const events = [
+        said('u1', '第一轮', 100), replied(1, '答一', 110),
+        said('u2', '夜里说的', 200), replied(2, '[不发]', 220),
+        said('u3', '第三轮', 300), replied(3, '答三', 330),
+        said('u4', '这一轮要交的', 400),
+    ]
+    const sends = [
+        { at: 50, text: '第一轮之前发的' },
+        { at: 210, text: '中途发到手机的话' },
+        { at: 320, text: '第三轮中途的话' },
+        { at: 410, text: '这一轮之后发的' },
+    ]
+    const text = recentTurnsText(events, { turns: 5, chars: 8_000, before: ['u4'], sends })
+    assert.ok(text.includes('用户：夜里说的\n\n你（中途发的）：中途发到手机的话\n\n用户：第三轮'), '只发了中途的话的一轮，下一句是新的一轮')
+    assert.ok(!text.includes('[不发]'))
+    assert.ok(text.includes('用户：第三轮\n\n你（中途发的）：第三轮中途的话\n\n你：答三'), '按时间排在最终回复前面')
+    assert.ok(!text.includes('第一轮之前发的') && !text.includes('这一轮之后发的'))
+    assert.ok(!recentTurnsText(events, { turns: 1, chars: 8_000, before: ['u4'], sends }).includes('中途发到手机的话'), '算在轮数里')
+    assert.equal(recentTurnsText(events, { turns: 5, chars: 8_000, before: ['u4'] }).includes('中途'), false, '没给就没有')
+})
+
+test('交接带的原文：中途发送没读到时写明一句；没有交接边界挡着时，最后一条之后发的也收', () => {
+    const said = (id, text, time) => ({ type: 'user/message', time, data: { id, role: 'user', source: { kind: 'user', speaker: { kind: 'user' } }, content: [{ type: 'text', text }] } })
+    const events = [said('u1', '说一句', 100)]
+    const text = recentTurnsText(events, { turns: 5, chars: 8_000, sendsUnread: true })
+    assert.ok(text.startsWith(`${RECENT_LEAD}\n${RECENT_SENDS_UNREAD}\n\n用户：说一句`))
+    assert.equal(recentTurnsText([], { turns: 5, chars: 8_000, sendsUnread: true }), '', '什么都没有就不写')
+    assert.ok(recentTurnsText(events, { turns: 5, chars: 8_000, sends: [{ at: 150, text: '后来发的' }] }).endsWith('你（中途发的）：后来发的'))
 })

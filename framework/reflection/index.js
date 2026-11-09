@@ -18,6 +18,8 @@
  *   - 别的结束原因：`minMinutes`。
  *   - 超过 `lostAfterMinutes` 还没有结果：当作丢失，`nextAt` 改成现在，报一次。
  * - **让位**：用户本人在别的会话说话时，先记下 `yielding`，再 `cancel({kind:'user'}, {keepInbox: true})`。
+ * - **交接整理**（`tidy`）：主动交接时跑一次，和后台思考分开：一个角色是 `tidy` 的会话，每次开新对话。交给它事实、程序筛过的经历摘录
+ *   （读量有上限）、交接文档路径和模板。交接工具立刻返回，换对话等它跑完；超时、出错都算跑完，报出来；重启打断的下次启动报。
  * - **主动联系**：留言存下以后马上经 `core.deliver('hub')` 交给中枢，休息时段也照交（发到手机那一下由出口管）。
  *   交不出的留着，下一次检查再交。打开主动联系只认用户本人的话（`latestFromUser`），口令是配置。
  *   待告知留言段只对中枢有内容，变化时只报新增的几条；`told` 不声明 `writesSegments`（标记之后可能又有新留言）。
@@ -26,17 +28,21 @@
  * @module @loveandbeepbrother/dsh-galatea/reflection
  */
 
+import { mkdir, writeFile } from 'node:fs/promises'
+import { dirname } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { defineDomain } from '@deepseek-ai/dsh-storage-domain'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { z } from 'zod'
-import { STARTER_TEMPLATE, clampMinutes, factsText, turnOutcome } from './rhythm.js'
+import { STARTER_TEMPLATE, TIDY_TEMPLATE, clampMinutes, factsText, turnOutcome } from './rhythm.js'
 
 export const name = 'mind-framework-reflection'
 export const inject = ['core', 'storageDomain', 'agents', 'sessionQuery']
 export const REFLECTION_SOURCE = 'reflection'
 export const CONTACT_SOURCE = 'contact'
+export const TIDY_SOURCE = 'handoff-tidy'
 export const CONTACT_SEGMENT = 'contact-pending'
 const SPEAKER = Object.freeze({ kind: 'program', plugin: name })
 /** 事实段里每类异常最近一条的说明留多少字。 */
@@ -88,6 +94,13 @@ export const Config = Schema.object({
     defaultMinutes: Schema.natural().default(180),
     maxMinutes: Schema.natural().default(720),
     lostAfterMinutes: Schema.natural().default(180),
+    tidyRoles: Schema.array(Schema.string()).default(['hub']).description('哪些角色的会话交接时先跑一次整理；空的不跑'),
+    tidyMaxMinutes: Schema.natural().default(5).description('交接整理最多跑多久（这期间用户的下一条消息在等）；超时取消，已写的留着，交接照常'),
+    tidyDigestChars: Schema.natural().default(60_000).description('交给交接整理的经历摘录的上限（字），超了留最新的'),
+    tidyTemplateFile: Schema.string().default('交接整理.md').description('交接整理的模板（相对内容库）'),
+    tidySessionTitle: Schema.string().default('交接整理'),
+    tidyProvider: Schema.string().default('').description('交接整理用的模型提供方；空就不选，用 DSH 设的默认模型'),
+    tidyModel: Schema.string().default(''),
 })
 
 const minutes = value => value * 60_000
@@ -200,6 +213,19 @@ export async function apply(ctx, config, deps = {}) {
         }
     }
 
+    /** 各插件交来的几行；读不出的那一项标出来。 */
+    async function contributed() {
+        const collected = []
+        for (const { name, lines } of contributors.values()) {
+            try {
+                collected.push({ name, lines: (await lines(ctx)).map(String) })
+            } catch {
+                collected.push({ name, lines: null })
+            }
+        }
+        return collected
+    }
+
     async function template() {
         const read = await core.content.read(config.templateFile).catch(() => null)
         if (read !== null && read.text.trim() !== '') return read.text.trim()
@@ -226,13 +252,7 @@ export async function apply(ctx, config, deps = {}) {
                 lines: unhandled.map(item => `${item.kind} × ${item.count}，最近一条：${item.lastText.slice(0, UNHANDLED_TEXT_CHARS)}`),
             })
         }
-        for (const { name, lines } of contributors.values()) {
-            try {
-                contributions.push({ name, lines: (await lines(ctx)).map(String) })
-            } catch {
-                contributions.push({ name, lines: null })
-            }
-        }
+        contributions.push(...await contributed())
         const facts = factsText({ now: now(), last: current.last, contact: contactSettings(), pendingContacts: pendingMessages().length, range, contributions, timezone: core.timezone })
         const text = `${facts}\n\n${await template()}`
         const messageId = `reflection-${now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
@@ -279,7 +299,142 @@ export async function apply(ctx, config, deps = {}) {
         return finish(config.minMinutes, result.outcome, '')
     }
 
+    /* ------------------------------------------------------------------ 交接整理 */
+
+    /** 正在跑的一次：`{ target, messageId, declared, resolve }`。 */
+    let tidyRun = null
+    let tidyChecked = false
+
+    /** 交接整理的会话：角色是 tidy 的那一个；没有时在中枢的工作目录建一个。 */
+    async function ensureTidy() {
+        const existing = core.sessions.withRole('tidy')[0]
+        if (existing !== undefined) return String(existing)
+        const controller = ctx.get('sessionController')
+        const hub = core.sessions.hub()
+        if (controller === undefined || hub === null) throw new Error(hub === null ? '没有中枢会话' : '当前组合没有 sessionController')
+        const cwd = ctx.agents.get(SessionId(hub))?.session?.header?.cwd
+        const created = await controller.create({ ...cwd === undefined ? {} : { cwd } })
+        const sessionId = String(created?.sessionId ?? created?.session?.id ?? created?.id)
+        await core.sessions.assign(sessionId, 'tidy', { by: SPEAKER })
+        try {
+            await controller.rename?.({ sessionId, title: config.tidySessionTitle })
+        } catch (error) {
+            reportOnce('reflection/rename-failed', sessionId, { sessionId, text: `交接整理会话没能起名（${error?.message ?? error}），照样用` })
+        }
+        return sessionId
+    }
+
+    /** 这个会话每次开新对话时交的文档：任务本身在随后的那条消息里。 */
+    async function freshConversation(sessionId) {
+        const context = ctx.get('context')
+        if (typeof context?.handoff !== 'function') return
+        const document = deps.tidyDocument ?? dshHomePath('galatea', 'tidy-session.md')
+        await mkdir(dirname(document), { recursive: true })
+        await writeFile(document, '这个会话专门做交接整理：每次交接开一段新对话，任务在下一条消息里。\n')
+        const result = await context.handoff(sessionId, document)
+        if (result?.scheduled !== true) throw new Error(`开不了新对话：${result?.reason ?? '没说原因'}`)
+    }
+
+    async function tidyBrief(sessionId, document) {
+        const excerpt = ctx.get('experience')?.digest?.(sessionId, { maxChars: config.tidyDigestChars, now: now() })
+        const read = await core.content.read(config.tidyTemplateFile).catch(() => null)
+        if (read === null) reportOnce('reflection/template-missing', config.tidyTemplateFile, { text: `交接整理的模板 ${config.tidyTemplateFile} 不存在，用框架自带的起步模板` })
+        const lines = (await contributed()).filter(({ lines }) => lines === null || lines.length > 0)
+            .map(({ name, lines }) => `${name}：\n${lines === null ? '- 读取失败' : lines.map(line => `- ${line}`).join('\n')}`)
+        return [
+            '【交接整理】',
+            `要交接的会话：${sessionId}`,
+            `交接文档：${document}`,
+            `时间上限：${config.tidyMaxMinutes} 分钟，到点取消，已写的留着。`,
+            ...lines,
+            excerpt === undefined
+                ? '经历摘录：没有装经历库，只能看交接文档。'
+                : `经历摘录（${excerpt.entries} 条${excerpt.omitted > 0 ? `，更早的 ${excerpt.omitted} 条超过上限没放，最早一条是 ${excerpt.oldestRef}` : ''}）：\n${excerpt.text}`,
+            read?.text ?? TIDY_TEMPLATE,
+        ].join('\n\n')
+    }
+
+    /** 这一轮跑完了就交回结果。 */
+    async function settleTidy() {
+        const run = tidyRun
+        if (run === null) return
+        const result = turnOutcome(await readEvents(run.target), run.messageId)
+        if (!result.found || !result.ended) return
+        if (result.outcome !== 'completed') return run.resolve({ failure: `这一轮以 ${result.outcome} 结束` })
+        run.resolve({ summary: run.declared?.summary ?? Array.from(result.text).slice(0, 300).join(''), gaps: run.declared?.gaps ?? '' })
+    }
+
+    /** 这个会话交接时要不要跑整理。 */
+    const tidyApplies = sessionId => config.tidyMaxMinutes > 0 && config.tidyRoles.includes(core.sessions.roleOf(String(sessionId)))
+
+    /**
+     * 交接之前跑一次整理。不抛错，也不挡交接。
+     * @param options.document - 交接文档的绝对路径。
+     * @returns `{ status: 'skipped' }`（这个角色不跑）；`{ status: 'done', summary, gaps, seconds, tokens }`；`{ status: 'failed', reason, seconds }`。
+     */
+    async function tidy(sessionId, { document } = {}) {
+        const id = String(sessionId)
+        if (!tidyApplies(id)) return { status: 'skipped' }
+        const startedAt = Date.now()
+        const seconds = () => Math.round((Date.now() - startedAt) / 1000)
+        const fail = (reason) => {
+            core.report('reflection/tidy-failed', { sessionId: id, text: `交接整理没做完（${reason}），交接照常；已写的留着`, data: { subject: id } })
+            return { status: 'failed', reason, seconds: seconds() }
+        }
+        if (tidyRun !== null) return fail('上一次还在跑')
+        let target
+        try {
+            target = await ensureTidy()
+            if (await core.quota.state(target) === 'limited') return fail('额度用完了')
+            if (config.tidyProvider !== '') (await resolveAgent(target)).model?.select?.({ provider: config.tidyProvider, model: config.tidyModel })
+            await freshConversation(target)
+            const text = await tidyBrief(id, document)
+            const messageId = `tidy-${now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+            const finished = new Promise((resolve) => {
+                tidyRun = { target, messageId, declared: null, resolve }
+            })
+            const delivered = await core.deliver(target, {
+                key: messageId, id: messageId, text,
+                source: { kind: TIDY_SOURCE, intent: 'prompt', key: messageId },
+                speaker: SPEAKER,
+                reply: { to: 'none' },
+            })
+            if (delivered.status === 'unavailable') throw new Error(delivered.reason)
+            const stopped = new Promise((resolve) => {
+                const limit = deps.tidyLimitMs ?? minutes(config.tidyMaxMinutes)
+                const timer = setTimeout(() => resolve({ failure: `超过 ${config.tidyMaxMinutes} 分钟` }), limit)
+                timer.unref?.()
+                finished.finally(() => clearTimeout(timer))
+            })
+            const outcome = await Promise.race([finished, stopped])
+            if (outcome.failure !== undefined) {
+                ctx.agents.get(SessionId(target))?.cancel({ kind: 'user' })
+                return fail(outcome.failure)
+            }
+            const usage = await Promise.resolve(ctx.get('context')?.usage?.(target)).catch(() => null)
+            return { status: 'done', summary: outcome.summary, gaps: outcome.gaps, seconds: seconds(), tokens: usage?.tokens ?? null }
+        } catch (error) {
+            return fail(String(error?.message ?? error))
+        } finally {
+            tidyRun = null
+        }
+    }
+
+    /** 上次启动时跑到一半的整理（重启打断的）：启动后报一次。 */
+    async function reportInterruptedTidy() {
+        if (tidyChecked) return
+        tidyChecked = true
+        const target = core.sessions.withRole('tidy')[0]
+        if (target === undefined || ctx.agents.get(SessionId(target))?.status === 'running') return
+        const events = await readEvents(String(target))
+        const last = events.filter(event => event?.type === 'user/message' && event.data?.source?.kind === TIDY_SOURCE).at(-1)
+        if (last === undefined) return
+        const result = turnOutcome(events, String(last.data.id))
+        if (result.found && !result.ended) core.report('reflection/tidy-failed', { sessionId: String(target), text: '上次的交接整理被重启打断了，没做完；交接照常', data: { subject: String(target) } })
+    }
+
     async function tick() {
+        await reportInterruptedTidy()
         if (closed) return
         const sessionId = backgroundSessionId()
         const current = state()
@@ -325,6 +480,10 @@ export async function apply(ctx, config, deps = {}) {
     ctx.on('session/event', (session, event) => {
         if (closed) return
         const sessionId = String(session?.id ?? '')
+        if (sessionId === tidyRun?.target) {
+            if (event?.type === 'turn/end') setTimeout(() => settleTidy().catch(() => {}), 200).unref?.()
+            return
+        }
         if (sessionId === backgroundSessionId()) {
             if (event?.type === 'turn/end') setTimeout(() => serial(() => collect(sessionId)).catch(() => {}), 200).unref?.()
             return
@@ -342,6 +501,8 @@ export async function apply(ctx, config, deps = {}) {
     ctx.effect(() => () => clearInterval(timer), 'mind-framework-reflection: timer')
 
     ctx.provide('reflection', {
+        tidy,
+        tidyApplies,
         requestSoon,
         state: () => {
             const { nextAt, running, last } = state()
@@ -453,6 +614,7 @@ export async function apply(ctx, config, deps = {}) {
     })
 
     ctx.effect(() => core.declareSource(REFLECTION_SOURCE, { intent: 'prompt', annotate: false, speaker: SPEAKER }), 'mind-framework-reflection: reflection source')
+    ctx.effect(() => core.declareSource(TIDY_SOURCE, { intent: 'prompt', annotate: false, speaker: SPEAKER }), 'mind-framework-reflection: tidy source')
     ctx.effect(() => core.declareSource(CONTACT_SOURCE, { intent: 'prompt', annotate: false, speaker: SPEAKER }), 'mind-framework-reflection: contact source')
 
     const output = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }
@@ -478,6 +640,19 @@ export async function apply(ctx, config, deps = {}) {
             return { recorded: true, nextMinutes, note: '这一轮正常结束时作数' }
         }),
     }, { effect: 'write', allow: role('background') })
+    tool({
+        name: 'assistant_tidy_done',
+        description: 'Finish this handoff tidy: say in one or two sentences what you changed, and what the handoff document gained or the hub should know.',
+        parameters: {
+            summary: { type: 'string', required: true, description: 'What changed.' },
+            gaps: { type: 'string', description: 'What was added to the handoff document, or what the hub should know.' },
+        },
+        execute: async (args) => {
+            if (tidyRun === null) return { recorded: false, reason: '现在没有在跑的交接整理' }
+            tidyRun.declared = { summary: String(args.summary ?? ''), gaps: String(args.gaps ?? '') }
+            return { recorded: true }
+        },
+    }, { effect: 'write', allow: role('tidy') })
     tool({
         name: 'assistant_contact_user',
         description: 'Leave a message you want to tell the user on your own initiative (a finding, a decision the user needs to make, a thought of your own). It is handed to the hub session, which tells the user.',

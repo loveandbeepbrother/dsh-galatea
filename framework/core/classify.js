@@ -14,7 +14,9 @@
  * 改作品和拿不准的仍要用户本人说，不然中枢连日常维护都派不出去。按核心记下的说话人认，不看正文：说话人由交话的一方
  * 按真实调用会话写明（渠道的会话间发话按调用会话本身认，子代理发不了）；外部调用方、后台思考和别的会话都不是中枢，标注不变。
  * 登记不到的照标，并报一条异常（每种 kind 只报一次）。
- * 用户本人从渠道说的话也写一行，只说从哪来（`via.label`，入口声明的），模型才知道这句是在哪说的；桌面上说的没有 `via`，不标。
+ * 用户本人从渠道说的话也写一行，只说从哪来（`via.label`，入口声明的），模型才知道这句是在哪说的；桌面上说的没有 `via`，不标来源。
+ * 当提问交的每条输入（不论哪个入口、标不标来源），标注最前面都写它到达的时刻（`[11-08 周六 09:24 +08:00]`，核心的时区）：
+ * 上游的时间行十分钟最多一条，Claude Code 只有开对话那天的日期，模型靠这个对上“现在”和每句话是什么时候说的。
  *
  * @module @loveandbeepbrother/dsh-galatea/core/classify
  */
@@ -155,8 +157,9 @@ export function createClassifier({ report, hub = () => null, roleOf = () => unde
      * pre-step 里给这一步的消息补上分类、默认出处和来源标注（只加字段；第一个文本块开头加标注）。
      * @param messages - 已经写好出处的消息。
      * @param options.triggerId - 开启这一轮的那条消息的编号（不是第一步时为 `null`）。
+     * @param options.arrivalOf - 消息编号 → 到达时刻的文字（核心的时区）；当提问的输入写在标注最前面。不给就不写时刻。
      */
-    function stamp(messages, { triggerId = null, sessionId } = {}) {
+    function stamp(messages, { triggerId = null, sessionId, arrivalOf } = {}) {
         let changed = false
         const result = messages.map((message) => {
             const source = message?.source
@@ -174,18 +177,20 @@ export function createClassifier({ report, hub = () => null, roleOf = () => unde
                 reportOnce(`core/unannotated-kind:${source.kind}`, source.kind, `消息来源 ${source.kind} 没有登记，照样加了来源标注`, sessionId)
             }
             const ownVia = speaker?.kind === 'user' && declaration?.annotate !== false ? source.via?.label : undefined
-            if (Object.keys(additions).length === 0 && !annotate && ownVia === undefined) return message
+            const arrival = (additions.intent ?? source.intent) === 'prompt' ? arrivalOf?.(String(message.id)) : undefined
+            if (Object.keys(additions).length === 0 && !annotate && ownVia === undefined && arrival === undefined) return message
             changed = true
             const nextSource = { ...source, ...additions }
-            if (ownVia !== undefined) {
-                const annotation = viaText(ownVia)
-                return freezeMessage({ ...message, content: annotated(message.content, annotation), source: { ...nextSource, annotation } })
+            let label
+            if (ownVia !== undefined) label = viaText(ownVia)
+            else if (annotate) {
+                const hubId = nextSource.speaker?.kind === 'session' ? hub() : null
+                const fromHub = hubId !== null && String(nextSource.speaker.sessionId) === String(hubId)
+                    && sessionId !== undefined && roleOf(String(sessionId)) === 'worker'
+                label = annotationText(nextSource, { fromHub })
             }
-            if (!annotate) return freezeMessage({ ...message, source: nextSource })
-            const hubId = nextSource.speaker?.kind === 'session' ? hub() : null
-            const fromHub = hubId !== null && String(nextSource.speaker.sessionId) === String(hubId)
-                && sessionId !== undefined && roleOf(String(sessionId)) === 'worker'
-            const annotation = annotationText(nextSource, { fromHub })
+            const annotation = [arrival === undefined ? undefined : `[${arrival}]`, label].filter(part => part !== undefined).join('')
+            if (annotation === '') return freezeMessage({ ...message, source: nextSource })
             return freezeMessage({ ...message, content: annotated(message.content, annotation), source: { ...nextSource, annotation } })
         })
         return changed ? result : messages

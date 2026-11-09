@@ -52,6 +52,17 @@ export function usageReminder(tokens, fallback) {
 /** 执行方的压缩不收额外要求时，压缩工具的结果和服务的结果里写的话。 */
 export const INSTRUCTIONS_IGNORED = '这个会话的压缩不收额外要求，会按默认压缩，指定要保留的内容没用上'
 
+const HANDOFF_SCHEDULED = '已安排：这一轮结束后换新对话，交接文档随用户下一条消息交给新对话。'
+
+/** 交接整理的结果写给接手的对话的话。 */
+export function tidyNote(tidied) {
+    const lead = '（DSH 提示，不是用户发言）交接整理'
+    if (tidied.status === 'skipped') return `${lead}这次没跑。`
+    if (tidied.status === 'failed') return `${lead}没做完（${tidied.reason}），已写的留着，已经报了。`
+    const cost = `用时 ${tidied.seconds} 秒${tidied.tokens === null ? '' : `，上下文约 ${tidied.tokens} token`}`
+    return `${lead}（${cost}）：${tidied.summary}${tidied.gaps === '' ? '' : `\n要你知道的：${tidied.gaps}`}`
+}
+
 const output = { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] }
 
 export function apply(ctx, config) {
@@ -105,7 +116,8 @@ export function apply(ctx, config) {
         }
     }
 
-    async function handoff(sessionId, document) {
+    /** @param options.ready - 换对话要等它（交接之前的整理）；不给就不等。 */
+    async function handoff(sessionId, document, { ready } = {}) {
         const id = String(sessionId)
         if (typeof document !== 'string' || document.trim() === '' || !isAbsolute(document)) return { scheduled: false, reason: '要给交接文档的绝对路径' }
         let text
@@ -120,13 +132,15 @@ export function apply(ctx, config) {
             core.report('context/handoff-unavailable', { sessionId: id, text: `${cannot(executor, '换新对话')}，这次交接没做` })
             return { scheduled: false, reason: cannot(executor, '换新对话') }
         }
-        const onSwitched = ({ at, landed = false } = {}) => {
+        const onSwitched = async ({ at, landed = false } = {}) => {
             markHandoff(id, document, at)
             if (landed) return
-            land(id, { kind: 'handoff', text, document, executor })
+            // 交接之前的整理可能往文档后面补过：换的时候再读。
+            const current = await readFile(document, 'utf8').then(value => value.trim()).catch(() => text)
+            land(id, { kind: 'handoff', text: current === '' ? text : current, document, executor })
                 .catch(error => core.report('context/boundary-failed', { sessionId: id, text: `DSH 记录里的交接边界没落下（${error?.message ?? error}）` }))
         }
-        const result = await caps.newConversation(id, document, { onSwitched })
+        const result = await caps.newConversation(id, document, { onSwitched, ready })
         if (result?.scheduled !== true) core.report('context/handoff-refused', { sessionId: id, text: `交接没做：${result?.reason ?? '执行方没说原因'}` })
         return result?.scheduled === true ? { scheduled: true } : { scheduled: false, reason: String(result?.reason ?? '执行方没说原因') }
     }
@@ -155,7 +169,10 @@ export function apply(ctx, config) {
      * @param options.handoffDocument - 这份交接的边界落下之后的记录不算。
      */
     async function recentTurns(sessionId, { before, handoffDocument } = {}) {
-        return recentTurnsText(await core.readEvents(String(sessionId)), { turns: config.recentTurns, chars: config.recentChars, before, handoffDocument })
+        // 交接整理每次都是全新的一段，上一次的内容不带。
+        if (core.sessions.roleOf(String(sessionId)) === 'tidy') return ''
+        const { sends, unread } = await core.exits.sentBetween(String(sessionId))
+        return recentTurnsText(await core.readEvents(String(sessionId)), { turns: config.recentTurns, chars: config.recentChars, before, handoffDocument, sends, sendsUnread: unread })
     }
 
     async function compact(sessionId, options = {}) {
@@ -238,10 +255,24 @@ export function apply(ctx, config) {
         execute: async (args, exec) => {
             const sessionId = String(exec?.agent?.session?.id ?? '')
             if (sessionId === '') throw new Error('无法确定调用会话')
-            const result = await handoff(sessionId, String(args?.document ?? ''))
-            return result.scheduled
-                ? '已安排：这一轮结束后换新对话，交接文档随用户下一条消息交给新对话。'
-                : `没有交接：${result.reason}`
+            const document = String(args?.document ?? '')
+            const reflection = ctx.get('reflection')
+            const tidies = reflection?.tidyApplies?.(sessionId) === true
+            // 工具一次调用有时限（Claude Code 的 HTTP MCP 是 60 秒），整理不能等在这里：立刻返回，换对话等整理跑完，结果放进下一轮。
+            let release = () => {}
+            const ready = tidies ? new Promise((resolve) => { release = resolve }) : undefined
+            const result = await handoff(sessionId, document, { ready })
+            if (!result.scheduled) {
+                release()
+                return `没有交接：${result.reason}`
+            }
+            if (!tidies) return HANDOFF_SCHEDULED
+            // 先让执行方接受（拒绝的不白跑）。整理不抛错；超时、出错都会结束，换对话不会一直等。
+            reflection.tidy(sessionId, { document })
+                .then(tidied => core.attach(sessionId, `handoff-tidy-${Date.now()}`, tidyNote(tidied)))
+                .catch(error => core.report('context/tidy-note-failed', { sessionId, text: `交接整理的结果没交给会话（${error?.message ?? error}）` }))
+                .finally(release)
+            return `${HANDOFF_SCHEDULED}交接整理在后台跑，用户的下一条消息最多等它跑完再开新对话；结果会放在新对话的开头。`
         },
     }), { effect: 'write', allow: notExternal, alwaysLoad: true })
 

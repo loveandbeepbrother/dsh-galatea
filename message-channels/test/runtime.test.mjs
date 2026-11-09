@@ -1306,6 +1306,28 @@ test('入站图片：随消息交给准入，准入后与正文一起清空', as
     assert.equal(row.images, null)
 })
 
+test('合并准入：平台自己声明的合并窗口优先于全局的（读消息本身就慢的平台等得久一点）', async (t) => {
+    const harness = await createHarness({
+        seed: async ({ tables, credentials }) => seedBinding(tables, credentials, {}),
+        runtime: { mergeTextMs: 2000, mergeImageMs: 30000 },
+    })
+    t.after(async () => {
+        await harness.runtime.close()
+    })
+    harness.qq.platform.mergeTextMs = 6000
+    await settle(harness.runtime)
+    await listenOptions(harness.qq.state).onMessage(
+        { kind: 'private', platform: 'qq', accountId: 'account-1', conversationId: 'owner-1', senderId: 'owner-1', messageId: 'm-slow', text: '慢平台的一句' },
+        anchorOf('m-slow'),
+    )
+    harness.advance(2500)
+    await settle(harness.runtime)
+    assert.equal(harness.ingressLog.admits.length, 0, '全局的 2 秒到了，平台声明的 6 秒还没到')
+    harness.advance(4000)
+    await settle(harness.runtime)
+    assert.equal(harness.ingressLog.admits.length, 1, '平台声明的时间到了才准入')
+})
+
 test('合并准入：安静期内的连续消息合成一条准入，只回复一次，锚定最后一条', async (t) => {
     const harness = await createHarness({
         seed: async ({ tables, credentials }) => seedBinding(tables, credentials, {}),
@@ -3555,7 +3577,7 @@ test('已保存的测试聊天绑定重启后直接用真实准入 helper 连上
  * 测试聊天群：一个群对应一个项目会话
  * ------------------------------------------------------------------ */
 
-const PROJECT_SESSION = 'session-project-haocai'
+const PROJECT_SESSION = 'session-project-yuanhang'
 /** 测试用的群解析规则：群「项目-远航」接远航的项目会话；别的「项目-」群说明没有这个项目；其余不管（返回 null）。 */
 const voyageResolver = async ({ groupName }) => {
     if (groupName === '项目-远航') return { sessionId: PROJECT_SESSION, sessionTitle: '远航·项目会话' }
@@ -3869,7 +3891,7 @@ test('节奏在每个绑定自己的后台投递里等：不挡官方 QQ 的收�
  * 测试聊天群接任意会话、一句话改绑、会话不在了、任务进度
  * ------------------------------------------------------------------ */
 
-const OTHER_SESSION = 'session-yichan'
+const OTHER_SESSION = 'session-shilishu'
 const PNG = { mediaType: 'image/png', data: 'iVBORw0KGgo=' }
 
 /** 中枢绑着测试聊天私聊，另登记「远航·项目会话」与另一个普通会话；测试聊天在三个群里。 */
@@ -4216,7 +4238,7 @@ test('出口通知（任务进度）发到项目接的群：取第一个接了�
     assert.equal((await notice('k-next-day')).status, 'sent')
 })
 
-test('群：形状的旧群绑定原样可读、照常收发（显示为「项目·项目会话」）；断开测试聊天时已解绑的群行也删掉', async (t) => {
+test('旧形状的群绑定原样可读、照常收发（显示为「项目·项目会话」）；断开测试聊天时已解绑的群行也删掉', async (t) => {
     const { harness, project } = await sessionsHarness(t, {
         seed: async ({ tables, owner }) => {
             await tables.domain.table('bindings').put('chat-group-777', {
@@ -4516,9 +4538,11 @@ test('平台的主动发送能力：微信看对方最近一条消息是否在 2
     const now = 100 * 24 * 60 * 60 * 1000
     const { createWeixinPlatform } = await import('../platforms/weixin.js')
     const weixin = await createWeixinPlatform()
-    assert.equal(weixin.canDeliverNow({ live: true, lastInputAt: now - 23 * 60 * 60 * 1000, repliesLeft: 0, now }), true)
-    assert.equal(weixin.canDeliverNow({ live: true, lastInputAt: now - 25 * 60 * 60 * 1000, repliesLeft: 0, now }), false)
-    assert.equal(weixin.canDeliverNow({ live: true, lastInputAt: null, repliesLeft: 0, now }), false)
+    assert.equal(weixin.canDeliverNow({ live: true, lastInputAt: now - 23 * 60 * 60 * 1000, repliesLeft: 1, now }), true)
+    assert.equal(weixin.canDeliverNow({ live: true, lastInputAt: now - 23 * 60 * 60 * 1000, repliesLeft: 0, now }), false, '这条消息的 10 次用完了')
+    assert.equal(weixin.canDeliverNow({ live: true, lastInputAt: now - 23 * 60 * 60 * 1000, repliesLeft: 1, repliesNeeded: 2, now }), false)
+    assert.equal(weixin.canDeliverNow({ live: true, lastInputAt: now - 25 * 60 * 60 * 1000, repliesLeft: 5, now }), false)
+    assert.equal(weixin.canDeliverNow({ live: true, lastInputAt: null, repliesLeft: 5, now }), false)
     const { createQQPlatform } = await import('../platforms/qq.js')
     const qq = await createQQPlatform()
     assert.equal(qq.canDeliverNow({ live: true, lastInputAt: now, repliesLeft: 2, now }), true)
@@ -4712,6 +4736,24 @@ test('按能力选路：中途发送的文件也按能力改道，结果里写�
     assert.deepEqual(pushed.routed, ['这次发送的「清单.md」：测试聊天发不了文件，改经微信发出'])
     assert.equal(harness.weixin.state.sends[0].file.name, '清单.md')
     assert.equal(outgoingRows(harness).find(row => row.detour === true).routeNote, undefined, '结果里说过，不再接到下一条输入')
+    const sends = harness.runtime.sentBetween(SESSION_ID)
+    assert.equal(sends.length, 1, '改道的片和文字是同一次发送')
+    assert.match(sends[0].text, /^清单发你\n.*清单\.md$/s, '交接带的原文里有改道发出的片')
+})
+
+test('按能力选路：一轮回复里改道的片不算中途发送，外部调用方发的改道片也不算', async (t) => {
+    const file = await routeFile('大纲.md', '# 大纲\n')
+    const { harness, fromWeixin, fromQa } = await routeHarness(t)
+    await fromWeixin('w-1')
+    harness.advance(60_000)
+    await fromQa('a-1', '大纲呢')
+    harness.chat.addTurn({ inputs: [{ rpcId: 'req-a-1' }], assistants: [{ text: '大纲在这里' }], presented: [file] })
+    await settle(harness.runtime)
+    await settle(harness.runtime)
+    assert.equal(outgoingRows(harness).filter(row => row.detour === true).length, 1)
+    assert.deepEqual(harness.runtime.sentBetween(SESSION_ID), [])
+    await harness.runtime.push({ sessionId: SESSION_ID, text: '外部发的', files: [file], by: { kind: 'external', name: 'cli' } })
+    assert.deepEqual(harness.runtime.sentBetween(SESSION_ID), [])
 })
 
 /* ------------------------- 平台确定没发出：改道与暂停 ------------------------- */
@@ -6093,4 +6135,193 @@ test('README“接新平台”的最小例子原样能用：登记、配对、�
     harness.chat.addTurn({ inputs: [{ rpcId: 'req-in-1' }], assistants: [{ text: '你好呀' }] })
     await settle(harness.runtime)
     assert.deepEqual(printed, ['→ me: 你好呀'])
+})
+
+test('sentBetween：只交会话中途发到用户手上的话；外部调用方的、渠道自己的、没发出去的不算；改道发出的算一次；时间段外的不算', async (t) => {
+    const h = await rejectHarness(t)
+    await h.bothSaid()
+    const { runtime } = h.harness
+    const sends = () => runtime.sentBetween(SESSION_ID)
+    assert.deepEqual(sends(), [])
+
+    await runtime.push({ sessionId: SESSION_ID, text: '会话自己发的', by: { kind: 'session', sessionId: SESSION_ID, role: 'hub' } })
+    await runtime.push({ sessionId: SESSION_ID, text: '外部调用方发的', by: { kind: 'external', name: 'cli' } })
+    assert.deepEqual(sends().map(item => item.text), ['会话自己发的'])
+
+    h.script('fail')
+    await runtime.push({ sessionId: SESSION_ID, text: '改道发出的' })
+    assert.deepEqual(sends().map(item => item.text), ['会话自己发的', '改道发出的'], '原来那片算发出了，改道那条不重复')
+
+    const row = [...h.harness.tables.maps.outgoing.values()].find(item => item.push === true && item.text === '会话自己发的')
+    assert.equal(sends()[0].at, row.endSeq)
+    assert.deepEqual(runtime.sentBetween(SESSION_ID, row.endSeq + 1).map(item => item.text).includes('会话自己发的'), false)
+    assert.deepEqual(runtime.sentBetween(SESSION_ID, 0, row.endSeq - 1), [])
+    assert.deepEqual(runtime.sentBetween('session-other'), [], '别的会话的不算')
+
+    h.harness.tables.maps.outgoing.set('channel-note', { ...row, text: '渠道自己的说明', endSeq: row.endSeq + 5, system: 'stall', partIndex: 0 })
+    h.harness.tables.maps.outgoing.set('never-sent', { ...row, text: '没发出去的', endSeq: row.endSeq + 6, state: 'failed', errorCode: 'NOT_SENT', partIndex: 0 })
+    h.harness.tables.maps.outgoing.set('picture', { ...row, kind: 'image', text: 'D:/x.png', endSeq: row.endSeq + 7, partIndex: 0 })
+    h.harness.tables.maps.outgoing.set('half-1', { ...row, text: '发出的一半', endSeq: row.endSeq + 8, partIndex: 0, partCount: 2 })
+    h.harness.tables.maps.outgoing.set('half-2', { ...row, text: '没发出的一半', endSeq: row.endSeq + 8, partIndex: 1, partCount: 2, state: 'failed', errorCode: 'NOT_SENT' })
+    const texts = sends().map(item => item.text)
+    assert.ok(!texts.includes('渠道自己的说明') && !texts.includes('没发出去的'))
+    assert.ok(texts.includes('[图片]'))
+    assert.ok(texts.includes('发出的一半\n（这次发送有一部分没发出去）'))
+})
+
+test('微信一条消息最多回 10 片：中途发送数着次数、给最终回复留一次；用完不再调平台；对方再说一句就重新算', async (t) => {
+    const harness = await createHarness({
+        seed: async ({ tables, credentials }) => seedBinding(tables, credentials, { platform: 'weixin', accountId: 'account-wx', senderId: 'owner-wx' }),
+    })
+    t.after(async () => {
+        await harness.runtime.close()
+    })
+    await settle(harness.runtime)
+    const options = listenOptions(harness.weixin.state)
+    const say = messageId => options.onMessage(
+        { kind: 'private', platform: 'weixin', accountId: 'account-wx', conversationId: 'owner-wx', senderId: 'owner-wx', messageId, text: `说一句 ${messageId}` },
+        anchorOf(messageId, { contextToken: `ct-${messageId}` }),
+    )
+    await say('m-1')
+    await settle(harness.runtime)
+    for (let index = 0; index < 9; index += 1) {
+        const sent = await harness.runtime.push({ sessionId: SESSION_ID, text: `第 ${index + 1} 句` })
+        assert.equal(sent.sent, 1, `第 ${index + 1} 句：${JSON.stringify(sent)}`)
+        assert.equal(sent.repliesLeft, 10 - index - 1)
+    }
+    const calls = harness.weixin.state.sends.length
+    assert.deepEqual(await harness.runtime.push({ sessionId: SESSION_ID, text: '第 10 句' }), { status: 'unavailable', reason: 'NO_REPLIES_LEFT', repliesLeft: 1 }, '留一次给最终回复')
+    assert.equal(harness.weixin.state.sends.length, calls, '没有调平台去碰拒收')
+
+    await say('m-2')
+    await settle(harness.runtime)
+    const again = await harness.runtime.push({ sessionId: SESSION_ID, text: '接着说' })
+    assert.equal(again.sent, 1)
+    assert.equal(again.repliesLeft, 9, '新消息重新算 10 次')
+})
+
+test('微信：一轮回复超过这条消息还剩的次数：发前几片，写明还有多少、什么时候接着发；对方下一条消息回完后接着发', async (t) => {
+    const harness = await createHarness({
+        seed: async ({ tables, credentials }) => seedBinding(tables, credentials, { platform: 'weixin', accountId: 'account-wx', senderId: 'owner-wx' }),
+    })
+    t.after(async () => {
+        await harness.runtime.close()
+    })
+    await settle(harness.runtime)
+    const options = listenOptions(harness.weixin.state)
+    await options.onMessage(
+        { kind: 'private', platform: 'weixin', accountId: 'account-wx', conversationId: 'owner-wx', senderId: 'owner-wx', messageId: 'm-long', text: '讲长一点' },
+        anchorOf('m-long', { contextToken: 'ct-long' }),
+    )
+    await settle(harness.runtime)
+    for (let index = 0; index < 8; index += 1) await harness.runtime.push({ sessionId: SESSION_ID, text: `先说第 ${index + 1} 句` })
+    harness.chat.addTurn({ inputs: [{ rpcId: 'req-m-long' }], assistants: [{ text: Array.from({ length: 6 }, (_, index) => `第 ${index + 1} 段：${'字'.repeat(500)}`).join('\n\n') }] })
+    await settle(harness.runtime)
+    const sends = harness.weixin.state.sends
+    assert.equal(sends.length, 10, '正好用完 10 次，第 11 次不调平台')
+    const last = JSON.stringify(sends.at(-1))
+    assert.match(last, /微信 每条消息只能回 10 次/)
+    assert.match(last, /下一条消息/)
+    const deferred = outgoingRows(harness).filter(row => row.deferred === true && row.state === 'prepared')
+    assert.ok(deferred.length > 0, '其余留着')
+    await options.onMessage(
+        { kind: 'private', platform: 'weixin', accountId: 'account-wx', conversationId: 'owner-wx', senderId: 'owner-wx', messageId: 'm-next', text: '继续' },
+        anchorOf('m-next', { contextToken: 'ct-next' }),
+    )
+    await settle(harness.runtime)
+    harness.chat.addTurn({ inputs: [{ rpcId: 'req-m-next' }], assistants: [{ text: '好' }] })
+    await settle(harness.runtime)
+    assert.ok(sends.length > 11, `回完下一条接着发：${sends.length}`)
+    assert.equal(outgoingRows(harness).filter(row => row.deferred === true && row.state === 'prepared').length, 0)
+})
+
+test('微信比 10 次更早拒收：不靠计数，拒收本身算这条消息回不了了；不再碰平台，留到下一条消息之后；报一次，带平台的原话', async (t) => {
+    const reports = []
+    const harness = await createHarness({
+        seed: async ({ tables, credentials }) => seedBinding(tables, credentials, { platform: 'weixin', accountId: 'account-wx', senderId: 'owner-wx' }),
+        runtime: { report: (kind, detail) => reports.push({ kind, ...detail }) },
+    })
+    t.after(async () => {
+        await harness.runtime.close()
+    })
+    await settle(harness.runtime)
+    const options = listenOptions(harness.weixin.state)
+    const say = messageId => options.onMessage(
+        { kind: 'private', platform: 'weixin', accountId: 'account-wx', conversationId: 'owner-wx', senderId: 'owner-wx', messageId, text: `说一句 ${messageId}` },
+        anchorOf(messageId, { contextToken: `ct-${messageId}` }),
+    )
+    await say('m-1')
+    await settle(harness.runtime)
+    assert.equal((await harness.runtime.push({ sessionId: SESSION_ID, text: '第一句' })).sent, 1)
+    const accept = harness.weixin.state.sendImpl
+    harness.weixin.state.sendImpl = async () => {
+        throw Object.assign(new Error('weixin sendmessage rejected (-2)'), { code: 'SEND_REJECTED', definitelyRejected: true })
+    }
+    const rejected = await harness.runtime.push({ sessionId: SESSION_ID, text: '第二句' })
+    assert.equal(rejected.sent, 0)
+    assert.equal(rejected.unsent, 1, '留着，不算没送达')
+    assert.equal(rejected.failed, 0)
+    harness.weixin.state.sendImpl = accept
+    const ended = reports.filter(item => item.kind === 'channels/replies-ended')
+    assert.equal(ended.length, 1)
+    assert.match(ended[0].text, /weixin sendmessage rejected \(-2\)/)
+    assert.match(ended[0].text, /已送达 1 片/)
+    const calls = harness.weixin.state.sends.length
+    assert.deepEqual(await harness.runtime.push({ sessionId: SESSION_ID, text: '第三句' }), { status: 'unavailable', reason: 'NO_REPLIES_LEFT', repliesLeft: 0 }, '才发了一片也算用完')
+    assert.equal(harness.weixin.state.sends.length, calls, '不再碰平台')
+
+    await say('m-2')
+    await settle(harness.runtime)
+    harness.chat.addTurn({ inputs: [{ rpcId: 'req-m-2' }], assistants: [{ text: '回这一条' }] })
+    await settle(harness.runtime)
+    const texts = harness.weixin.state.sends.map(item => item.text)
+    assert.ok(texts.includes('回这一条'))
+    assert.ok(texts.includes('第二句'), '留着的那片接着发')
+    assert.equal(outgoingRows(harness).filter(row => row.state === 'failed' && row.reroutedTo === undefined).length, 0, '不算未送达')
+})
+
+test('微信：补发留待片时又被拒：不丢，回去接着等；下一条消息回完接着发，不重复', async (t) => {
+    const harness = await createHarness({
+        seed: async ({ tables, credentials }) => seedBinding(tables, credentials, { platform: 'weixin', accountId: 'account-wx', senderId: 'owner-wx' }),
+    })
+    t.after(async () => {
+        await harness.runtime.close()
+    })
+    await settle(harness.runtime)
+    const options = listenOptions(harness.weixin.state)
+    const say = messageId => options.onMessage(
+        { kind: 'private', platform: 'weixin', accountId: 'account-wx', conversationId: 'owner-wx', senderId: 'owner-wx', messageId, text: `说一句 ${messageId}` },
+        anchorOf(messageId, { contextToken: `ct-${messageId}` }),
+    )
+    const accept = harness.weixin.state.sendImpl
+    const REJECT = async () => {
+        throw Object.assign(new Error('weixin sendmessage rejected (-2)'), { code: 'SEND_REJECTED', definitelyRejected: true })
+    }
+    await say('m-1')
+    await settle(harness.runtime)
+    harness.weixin.state.sendImpl = REJECT
+    await harness.runtime.push({ sessionId: SESSION_ID, text: '留着的话' })
+    const waiting = () => outgoingRows(harness).filter(row => row.deferred === true && row.state === 'prepared')
+    assert.equal(waiting().length, 1)
+
+    // 下一条消息：回复发出了，补发那一片又被拒。
+    await say('m-2')
+    await settle(harness.runtime)
+    let calls = 0
+    harness.weixin.state.sendImpl = async (request) => {
+        calls += 1
+        return calls === 1 ? accept(request) : REJECT()
+    }
+    harness.chat.addTurn({ inputs: [{ rpcId: 'req-m-2' }], assistants: [{ text: '回第二条' }] })
+    await settle(harness.runtime)
+    assert.equal(waiting().length, 1, '又被拒也不丢')
+    assert.equal(outgoingRows(harness).filter(row => row.state === 'failed' && row.reroutedTo === undefined).length, 0)
+
+    harness.weixin.state.sendImpl = accept
+    await say('m-3')
+    await settle(harness.runtime)
+    harness.chat.addTurn({ inputs: [{ rpcId: 'req-m-3' }], assistants: [{ text: '回第三条' }] })
+    await settle(harness.runtime)
+    assert.equal(waiting().length, 0)
+    assert.equal(harness.weixin.state.sends.filter(item => item.text === '留着的话' && item.anchor.contextToken === 'ct-m-3').length, 1, '发出一次')
 })

@@ -562,6 +562,36 @@ test('产品工具：经核心的工具端点作为 HTTP MCP 服务 dsh 交给 C
     assert.deepEqual(closedTokens, ['token-S'])
 })
 
+test('strictMcpConfig：配了才交给 SDK，默认照旧继承', async () => {
+    const strict = harness({ tools: true, config: { strictMcpConfig: true } })
+    await collect(strict.adapter, { sessionId: 'S', messages: [system, user('u1', 'a')] })
+    assert.equal(strict.sdk.calls[0].options.strictMcpConfig, true)
+    const plain = harness({ tools: true })
+    await collect(plain.adapter, { sessionId: 'S', messages: [system, user('u1', 'a')] })
+    assert.equal(plain.sdk.calls[0].options.strictMcpConfig, undefined)
+})
+
+test('交接等整理：工具立刻返回；进程要等 ready 才换，下一条消息排在后面，新对话读到整理之后的文档', async () => {
+    const { adapter, sdk, files } = harness()
+    await collect(adapter, { sessionId: 'S', messages: [system, user('u1', 'a')] })
+    files.set('D:/交接/等.md', '整理之前')
+    let release
+    const ready = new Promise((resolve) => { release = resolve })
+    let switched = 0
+    assert.deepEqual(await adapter.handoff('S', 'D:/交接/等.md', { ready, onSwitched: () => { switched += 1 } }), { scheduled: true })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(switched, 0, '整理没跑完不换')
+    const next = collect(adapter, { sessionId: 'S', messages: [system, user('u1', 'a'), reply('r1', '答：a'), user('u2', 'b')] })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    assert.equal(sdk.calls.length, 1, '下一条消息在等')
+    files.set('D:/交接/等.md', '整理之前\n\n## 整理补充\n补了一条')
+    release()
+    await next
+    assert.equal(switched, 1)
+    assert.equal(sdk.calls.length, 2)
+    assert.match(JSON.stringify(sdk.calls[1].prompts ?? sdk.calls[1]), /整理补充/, '开新对话时才读文档')
+})
+
 test('没有产品工具时不挂 MCP 服务', async () => {
     const { adapter, sdk } = harness()
     await collect(adapter, { sessionId: 'S', messages: [system, user('u1', 'a')] })
@@ -1501,7 +1531,7 @@ test('额度恢复：恢复后已经自己回过一轮的会话不再唤醒，�
 test('额度恢复后仍被拒（按周的限额）：按新的恢复时间再关上，没唤醒的会话并进这次的积压', async () => {
     const world = outageWorld({ config: { quota: { modelProbe: false, usageQuery: false } } })
     await replayOutage(world)
-    // 5 小时窗口到点了，但本周额度也用完了：Claude Code 报来按周的限额与新的恢复时间（11 月 7 日 08:00）。
+    // 5 小时窗口到点了，但本周额度也用完了：Claude Code 报来按周的限额与新的恢复时间（3 月 14 日 08:00）。
     const weekly = Date.UTC(2026, 2, 14, 0, 0, 0)
     Object.assign(world.limited, { resetsAt: weekly / 1000, type: 'seven_day' })
     await world.at(bj(22, 30, 30))

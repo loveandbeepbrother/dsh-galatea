@@ -49,5 +49,5 @@ test('bundle 装配：框架模块装上就启用；上游 compaction-basic 停�
     assert.equal(rowOf(entries, 'compaction-basic').disabled, true, '原生压缩由框架的引擎接替')
 
     const added = entries.filter(entry => !baseline.some(row => row.id === entry.id))
-    assert.ok(added.length === 10 && added.every(entry => entry.id.startsWith('mind-framework-') && !entry.disabled), '十个框架模块，装上就启用')
+    assert.ok(added.length === 11 && added.every(entry => entry.id.startsWith('mind-framework-') && !entry.disabled), '十一个框架模块，装上就启用')
 })

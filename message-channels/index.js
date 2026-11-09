@@ -14,6 +14,7 @@
  * @module @loveandbeepbrother/dsh-galatea-channels
  */
 
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import QRCode from 'qrcode'
 import Schema from '@deepseek-ai/schemastery'
@@ -39,7 +40,7 @@ export const CHANNEL_RULES = [
     '工具调用之间写的文字只留在 DSH 桌面上，不发到手机；一轮之中要让用户知道的事用 `assistant_channel_send` 发。',
     '要把图片发给用户时，在回复里用 Markdown 图片写出本机绝对路径（`![说明](绝对路径)`），QQ 与微信会把它作为图片发送；',
     '只支持 PNG、JPEG、WebP、GIF，单张不超过 10MB。',
-    'QQ 官方机器人每条用户消息只能回 4 片，`assistant_channel_send` 中途发的也算在内；一条回复的全部文字合成一片放在最前',
+    '微信每条用户消息最多回 10 片，QQ 官方机器人只能回 4 片，`assistant_channel_send` 中途发的都算在内，用完要等用户下一条消息；QQ 官方机器人一条回复的全部文字合成一片放在最前',
     '（每 1000 字一片），随后是图片和文件，所以图片的说明会出现在图片前面，按“先说明、后附图”来写。',
     '一条回复里的几张图会按出现顺序编号 1、2、3……，自动拼成一张不压缩的大图发出，只占一片（太大时拆成两三张）；',
     '说明里按编号指代即可，一条回复不要超过 9 张图。DSH 桌面里仍逐张显示。后台一轮的转交文字末尾会写明这一轮还能发几片。',
@@ -49,7 +50,7 @@ export const CHANNEL_RULES = [
     '本机文件的链接在 QQ 与微信里只显示文件名；用 `present`（Claude Code 里是 `mcp__dsh__present`）交付的文档会同时原样发到用户正在用的 QQ 或微信。',
     '`assistant_channel_send` 让你在一轮之中随时给用户发消息，不必结束这一轮：开始一件要花时间的事、做到一半有了',
     '关键进展或发现、遇到需要用户尽早知道的情况，都可以用它，发不发、发什么由你判断。不要为了先回话而结束这一轮。',
-    '最终回复仍在这一轮结束时发出，不要重复已经发过的话。在 QQ 官方机器人上它总给最终回复留一次，结果会告诉你还剩几次。',
+    '最终回复仍在这一轮结束时发出，不要重复已经发过的话。在有次数限制的渠道（微信、QQ 官方机器人）上它总给最终回复留一次，结果会告诉你还剩几次。',
 ].join('')
 
 /**
@@ -124,6 +125,8 @@ export const Config = Schema.object({
         .description('中枢发到手机时渠道的先后（平台名，如 [weixin, qq]）；空就发到用户最近说话的渠道'),
     rerouteNote: Schema.boolean().default(false)
         .description('中枢的话没走 replyOrder 第一位时，在消息开头注明是从哪个渠道改发的'),
+    mergeWaitSeconds: Schema.natural().default(20)
+        .description('手机上分几条发的话合成一条再交：最后一条之后安静这么多秒才交给会话，来一条顺延一次，从第一条起最多等 2 分钟。按用户打字的节奏调：分条发得慢就调大，嫌回得慢就调小；0 不等。平台可以自己声明（比如读消息本身就慢的平台）'),
     downAlarmMinutes: Schema.natural().default(10)
         .description('一个平台断开多久后经别的渠道告诉用户一次（短暂重连不算）；0 不告诉'),
     quotaNotices: Schema.object({
@@ -324,6 +327,8 @@ export async function runSessionSend(ctx, runtime, core, args, exec) {
     const toGroup = args.reply === 'group'
     const where = toGroup ? '（这一轮的回复会发到你接的群里。）' : group ? '（这一轮的回复留在这个会话里，不发到群里，也不会转回给中枢。）' : ''
     const key = `session-${caller}-${String(exec?.callId ?? `${Date.now()}`)}`
+    // 这次转话的关联编号：接收方的条目带着它，结果里也写出来，发送方记录里的这次调用就能和接收方对上（同一次调用重试时不变）。
+    const link = linkOf(key)
     let result
     try {
         result = await core.deliver(target, {
@@ -331,6 +336,7 @@ export async function runSessionSend(ctx, runtime, core, args, exec) {
             text: `${header}${where}\n${text}`,
             source: { kind: SESSION_SOURCE, from: caller },
             speaker: { kind: 'session', sessionId: caller },
+            link,
             ...toGroup ? { reply: { to: 'exit' } } : {},
         })
     } catch (error) {
@@ -340,8 +346,14 @@ export async function runSessionSend(ctx, runtime, core, args, exec) {
     if (result.status === 'unavailable') return `没有发出：${name}现在收不到（${result.reason}）。`
     if (result.status === 'unknown') return `不确定交到没有：${name}的会话没能落盘（${result.reason}）。重试同一次调用不会重复交。`
     const reply = target === main ? '它的回复照常发到用户手机。' : toGroup ? '它这一轮的回复会发到它接的群里。' : '它的回复留在它自己的会话里，不会转回给你，也不外发。'
-    if (result.status === 'duplicate') return `这一条之前已经交给${name}了，没有再交。${reply}`
-    return `已交给${name}：它空闲时马上处理，正在回复时排在这一轮之后。${reply}`
+    if (result.status === 'duplicate') return `这一条之前已经交给${name}了，没有再交。${reply}（编号 ${link}）`
+    return `已交给${name}：它空闲时马上处理，正在回复时排在这一轮之后。${reply}（编号 ${link}）`
+}
+
+/** 转话的关联编号：由这次调用的键算出来，形状同 UUID。 */
+export function linkOf(key) {
+    const hex = createHash('sha256').update(String(key)).digest('hex')
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
 }
 
 /** 绑定工具被拒时的说明。 */
@@ -539,6 +551,7 @@ export async function apply(ctx, config = {}) {
         label: 'QQ、微信',
         sessions: () => state.runtime?.exitSessions?.() ?? [],
         notify: request => (state.runtime === null ? { status: 'failed', reason: '渠道还没起来' } : state.runtime.notify(request)),
+        sentBetween: (sessionId, from, to) => (state.runtime === null ? null : state.runtime.sentBetween(sessionId, from, to)),
     }), 'message-channels-framework: exit')
     // 换了中枢：私聊的消息按新中枢准入、回复，马上对一次账（攒着没交的私聊消息也是这时交进去）。
     ctx.effect(() => core.sessions.on('changed', ({ from, to }) => {
@@ -596,8 +609,8 @@ export async function apply(ctx, config = {}) {
         name: 'assistant_channel_send',
         description: 'Send a message to the user\'s phone right now, in the middle of your turn, without ending it: say what you are about to do before long work, report progress, or send images first. '
             + 'It goes to the channel the user last wrote from among those that can deliver right now (a group session only to its own group). Images are Markdown images with a local absolute path in `text`; `files` are local absolute paths sent as files, unchanged; when that channel cannot send files, a file goes through another channel that can, or is sent as text (small text files) or as its path on the computer, and the result says how. '
-            + 'Only the official QQ bot is limited: 4 replies per user message, shared by this tool, your final reply and any parts left over from earlier; there all text of one call is one part (per 1000 characters) placed first, then one part per image and per file. '
-            + 'On the official QQ bot this tool always leaves one reply for your final reply, and the result says how many parts were sent, how many did not fit, and how many replies are left. '
+            + 'WeChat allows 10 replies per user message and the official QQ bot 4, shared by this tool, your final reply and any parts left over from earlier; when they run out the rest waits for the next message from the user. On the official QQ bot all text of one call is one part (per 1000 characters) placed first, then one part per image and per file. '
+            + 'On these two channels this tool always leaves one reply for your final reply, and the result says how many parts were sent, how many did not fit, and how many replies are left. '
             + 'Your final reply is still sent when the turn ends; do not repeat there what you already sent.',
         parameters: {
             text: { type: 'string', description: 'Text to send now; may contain Markdown images with local absolute paths.' },
@@ -615,11 +628,11 @@ export async function apply(ctx, config = {}) {
             if (result.status !== 'sent') {
                 if (result.reason === 'NOT_BOUND') return '没有发出：这个会话没有绑定 QQ 或微信。'
                 if (result.reason === 'NO_REPLIES_LEFT') {
-                    return `没有发出：QQ 这条消息只剩 ${result.repliesLeft} 次回复（或已过期），要留给最终回复。要发的内容写进最终回复。`
+                    return `没有发出：这条消息只剩 ${result.repliesLeft} 次回复（或已过期），要留给最终回复。要发的内容写进最终回复。`
                 }
                 return '没有发出：对方还没有在 QQ 或微信上发过消息。'
             }
-            const left = result.repliesLeft === null ? '' : `QQ 这条消息还剩 ${result.repliesLeft} 次回复。`
+            const left = result.repliesLeft === null ? '' : `这条消息还剩 ${result.repliesLeft} 次回复。`
             const unsent = result.unsent > 0 ? `${result.unsent} 片放不下，没有发。` : ''
             const failed = result.failed > 0 ? `${result.failed} 片发送失败。` : ''
             // 这个渠道发不了的内容改了发法：照实说明。
@@ -689,10 +702,10 @@ export async function apply(ctx, config = {}) {
                 platforms: platforms,
                 createIngress: createMainTextIngress,
                 domain: domain,
-                // 手机上的话常分条发：最后一条之后安静 30 秒再一起准入，来一条顺延一次；从第一条起最多攒 2 分钟。
-                // 同一个想法分几条发时间隔多在 10 到 60 秒，12 秒只接得住最前面一小截。
-                mergeTextMs: 30_000,
-                mergeImageMs: 30_000,
+                // 手机上的话常分条发：最后一条之后安静一段（配置 mergeWaitSeconds，默认 20 秒）再一起准入，来一条顺延一次；
+                // 从第一条起最多攒 2 分钟。等多久因人而异，装好以后请用户按自己的节奏调（见 README）。
+                mergeTextMs: (config.mergeWaitSeconds ?? 20) * 1000,
+                mergeImageMs: (config.mergeWaitSeconds ?? 20) * 1000,
                 mergeCapMs: 120_000,
                 // 助手回复等待标记后最多再等 3 分钟。
                 waitTimeoutMs: 180_000,

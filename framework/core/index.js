@@ -35,6 +35,7 @@ import { createReports } from './report.js'
 import { createSegments, segmentsDomainSpec } from './segments.js'
 import { recordRoute, routeFromEvents, routeOf, triggerOf } from './routes.js'
 import { createSessions, sessionsDomainSpec } from './sessions.js'
+import { arrivalText } from './time.js'
 import { UPSTREAM_NATIVE_ONLY_TOOLS, UPSTREAM_SHARED_TOOLS, createTools } from './tools.js'
 import { STARTER_FILES } from '../starter.js'
 import { CommandDefinitionId } from '@deepseek-ai/dsh-commands/brand'
@@ -129,8 +130,8 @@ class Core extends Service {
     }
 
     /** 这个会话还没交到的提醒（执行方按它交给模型）。 */
-    attachments(sessionId) {
-        return this._parts.attachments.list(sessionId)
+    attachments(sessionId, options) {
+        return this._parts.attachments.list(sessionId, options)
     }
 
     /**
@@ -213,11 +214,11 @@ class Core extends Service {
         return this._parts.quietHours
     }
 
-    /** 出口登记：`register`（跟着登记它的插件撤）、`servedBy`、`foreground`、`list`、`notify`，见 `quiet.js`。 */
+    /** 出口登记：`register`（跟着登记它的插件撤）、`servedBy`、`foreground`、`list`、`notify`、`sentBetween`，见 `quiet.js`。 */
     get exits() {
-        const { servedBy, foreground, list, notify } = this._parts.exits
+        const { servedBy, foreground, list, notify, sentBetween } = this._parts.exits
         const register = definition => this.ctx.effect(() => this._parts.exits.register(definition), `mind-framework-core: exit ${definition?.id}`)
-        return { register, servedBy, foreground, list, notify }
+        return { register, servedBy, foreground, list, notify, sentBetween }
     }
 
     get external() {
@@ -225,10 +226,10 @@ class Core extends Service {
         return { list }
     }
 
-    /** 给执行方用的：`open`、`changes`、`declareSegment`、`audienceOf`，见 `segments.js`。 */
+    /** 给执行方用的：`open`、`changes`、`declareSegment`、`audienceOf`；给体检用的 `preview`，见 `segments.js`。 */
     get segments() {
-        const { open, changes, declareSegment, audienceOf } = this._parts.segments
-        return { open, changes, declareSegment, audienceOf }
+        const { open, preview, changes, declareSegment, audienceOf } = this._parts.segments
+        return { open, preview, changes, declareSegment, audienceOf }
     }
 
     /** 某个会话某一轮的回复去向 `{ turn, trigger, route }`，没有记录时为 `null`，见 `routes.js`。 */
@@ -406,6 +407,18 @@ export async function apply(ctx, config = {}, deps = {}) {
             starter: config.starter === false ? {} : STARTER_FILES,
             ...deps.git === undefined ? {} : { git: deps.git },
         })
+    if (content !== undefined) {
+        // 工具以外改的文件定时留痕：启动后一分钟一次，之后半小时一次。
+        const sweep = () => content.sweep().catch(error => selfReport('core/content-sweep-failed', { text: `内容库没能提交工具以外的改动（${error?.message ?? error}）` }))
+        const first = setTimeout(sweep, 60_000)
+        const again = setInterval(sweep, 30 * 60_000)
+        first.unref?.()
+        again.unref?.()
+        ctx.effect(() => () => {
+            clearTimeout(first)
+            clearInterval(again)
+        }, 'mind-framework-core: content sweep')
+    }
     if (content === undefined) selfReport('core/content-unavailable', { text: '内容目录（contentDirectory）明写成了空，心智与记忆的写入不可用' })
     // 启动时就准备好内容库：新建的内容库这时写进起步模板，不用等第一次写入。
     else content.prepare().catch(error => selfReport('core/content-prepare-failed', { text: `内容库没准备好（${error?.message ?? error}）` }))
@@ -516,6 +529,13 @@ export async function apply(ctx, config = {}, deps = {}) {
     const quietly = (label, job) => job.catch(error => selfReport('core/internal', { text: `${label}出错（${error?.message ?? error}）` }))
     /** 进收件箱时落在 next-step 的消息编号：认开启这一轮的消息时排除它们（会话被 steer 叫醒的轮）。 */
     const fromNextStep = new Set()
+    /** 消息进收件箱的时刻：标注里写的是到达的时刻，不是进模型的时刻（排着队的消息可能等了很久）。没进 pre-step 的过一天丢掉。 */
+    const arrivals = new Map()
+    const arrivalOf = (id) => {
+        const time = arrivals.get(id) ?? Date.now()
+        arrivals.delete(id)
+        return arrivalText(time, timezone)
+    }
     const quietHours = createQuietHours({ timezone, ...config?.quietHours ?? {} })
     const exits = createExits({ report: selfReport })
     const deliver = createDeliver({
@@ -540,6 +560,9 @@ export async function apply(ctx, config = {}, deps = {}) {
     }, { global: true })
     ctx.on('agent/inbox/inserted', ({ agent, message }) => {
         provenance.noteInserted(message)
+        const now = Date.now()
+        arrivals.set(String(message.id), now)
+        if (arrivals.size > 1000) for (const [id, time] of arrivals) if (now - time > 86_400_000) arrivals.delete(id)
         if (agent?.inbox?.nextStep?.some(item => item.id === message.id)) fromNextStep.add(String(message.id))
     })
     ctx.on('agent/pre-step', async (payload, next) => {
@@ -548,7 +571,7 @@ export async function apply(ctx, config = {}, deps = {}) {
         const decision = await next()
         if (decision?.kind !== 'enter') return decision
         const sessionId = String(payload.agent.session.id)
-        const messages = classifier.stamp(provenance.stamp(decision.messages), { triggerId, sessionId })
+        const messages = classifier.stamp(provenance.stamp(decision.messages), { triggerId, sessionId, arrivalOf })
         attachments.noteStamped(sessionId, payload.turn, messages)
         if (payload.step === 1) {
             const trigger = triggerId === null ? undefined : messages.find(message => String(message.id) === triggerId)

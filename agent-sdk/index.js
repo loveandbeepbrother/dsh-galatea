@@ -20,7 +20,7 @@ import { defineDomain } from '@deepseek-ai/dsh-storage-domain'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import { z } from 'zod'
 import { AgentSdkAdapter, IMAGE_REMIND_BYTES, withExtraHooks } from './adapter.js'
-import { createProcessParser, entrypointOf } from './transcript.js'
+import { createProcessParser, entrypointOf, interruptedTurns } from './transcript.js'
 import { DEFAULT_HANDOFF_CHARS, QUOTA_SOURCE, SURFACE_SOURCE } from './plan.js'
 import { QUOTA_DEFAULTS, USAGE_LIMIT, sessionAfter } from './quota.js'
 
@@ -31,6 +31,8 @@ export const inject = ['llm', 'agents', 'storageDomain', 'tools', 'core']
 export const ROUTE = 'agent-sdk'
 
 /** 执行方自己放进会话的消息（自己开的一轮、额度恢复后的唤醒）是谁说的。 */
+/** 重启前多久以内写过的记录才算这次重启打断的。 */
+const INTERRUPTED_WINDOW_MS = 15 * 60_000
 const SPEAKER = Object.freeze({ kind: 'program', plugin: 'agent-sdk-executor' })
 
 
@@ -198,6 +200,8 @@ export const Config = Schema.object({
         .description('上次压缩以来进入上下文的图片累计到这么多字节（base64）时，在下一轮开头提醒助手压缩；0 不提醒'),
     mcpServers: Schema.dict(Schema.any()).default({})
         .description('另外给 Claude Code 挂的 MCP 服务器：名字 → 配置（写法同 Agent SDK 的 mcpServers）；名字 dsh 留给产品工具'),
+    strictMcpConfig: Schema.boolean().default(false)
+        .description('只用这里写明的 MCP 服务器，不继承 Claude Code 自己的配置（用户级、项目级、local）。工作目录在某个仓库或它的工作树里时，那里给外部 CLI 配的服务器不会跟进来；要用的写进 mcpServers'),
     allowedTools: Schema.array(Schema.string()).default([])
         .description('另加的服务器里不用确认就能用的工具（如 mcp__chrome__take_snapshot）；其余照权限模式处理'),
     systemAppend: Schema.string().default('')
@@ -437,7 +441,7 @@ export function apply(ctx, config) {
         },
         // 提问还是参考由框架核心认，执行方不维护来源表。
         classify: message => ctx.core.classify(message),
-        attachments: sessionId => ctx.core.attachments(sessionId),
+        attachments: sessionId => ctx.core.attachments(sessionId, { delivering: true }),
         sourceAudience: message => ctx.core.sourceAudience(message),
         // 会话开头上下文由框架核心的上下文段给：开新对话、续接、每轮的变更说明、压缩后补发。
         segments: {
@@ -464,7 +468,10 @@ export function apply(ctx, config) {
             label: 'DSH 里的 Claude Code 进程',
             category: 'dsh',
             pull: async (cursor) => {
-                const files = { ...cursor?.files ?? {} }
+                // 经历库以前丢过只有操作、没有条目的批次（读取位置却走过去了）：从头重读一次补回来，条目和操作都按编号不重复。
+                const files = cursor?.opsRecovered === true
+                    ? { ...cursor.files }
+                    : Object.fromEntries(Object.entries(cursor?.files ?? {}).filter(([, item]) => item.cli === true || item.unmapped === true))
                 const owners = await processes()
                 const entries = []
                 const ops = []
@@ -507,11 +514,31 @@ export function apply(ctx, config) {
                         files[path] = { offset: result.resume.offset, size }
                     }
                 }
-                return { entries, ops, cursor: { files } }
+                return { entries, ops, cursor: { files, opsRecovered: true } }
             },
         })
         sub.effect(() => () => source.dispose(), 'agent-sdk-executor: experience source')
     })
+
+    // 上次重启打断的轮：补一条异常，也告诉那个会话，不然回报丢了没人知道。
+    const startedAt = Date.now()
+    const interruptedCheck = setTimeout(async () => {
+        try {
+            const root = config.transcriptDirectory || (config.env.CLAUDE_CONFIG_DIR ? join(config.env.CLAUDE_CONFIG_DIR, 'projects') : '')
+            if (root === '') return
+            for (const { sessionId, conversation, at } of await interruptedTurns({ root, since: startedAt - INTERRUPTED_WINDOW_MS, until: startedAt, owners: await processes() })) {
+                if (ctx.core.sessions.roleOf(sessionId) === 'tidy') continue
+                const when = new Date(at).toLocaleTimeString('zh-CN', { hour12: false, timeZone: ctx.core.timezone })
+                const text = `上次重启打断了这个会话正在跑的一轮（记录停在 ${when}），它的回报可能丢了`
+                ctx.core.report('turn-failed', { sessionId, text, data: { subject: conversation } })
+                await ctx.core.attach(sessionId, `turn-interrupted:${conversation}`, `（DSH 提示，不是用户发言）${text}。先核对做到了哪一步，再决定要不要接着做。`)
+            }
+        } catch (error) {
+            ctx.core.report('agent-sdk/interrupted-check-failed', { text: `查重启打断的轮时出错（${error?.message ?? error}）` })
+        }
+    }, 5_000)
+    interruptedCheck.unref?.()
+    ctx.effect(() => () => clearTimeout(interruptedCheck), 'agent-sdk-executor: interrupted check')
 
     ctx.core.executors.register({
         id: 'agent-sdk',
@@ -533,9 +560,10 @@ export function apply(ctx, config) {
             skillFilter: true,
             imageAccounting: true,
             // 会话的活动：还在跑的后台任务数、进程最后一次输出的时间；Watchdog 经核心问，看项目任务是不是真的没在动。
+            // busy：进程正在跑一轮，包括 Claude Code 自己开的（后台任务结束时），DSH 那边看不到这种。
             activity: (sessionId) => {
-                const { background, lastOutputAt } = adapter.activity(String(sessionId))
-                return { background, lastOutputAt }
+                const { background, busy, lastOutputAt } = adapter.activity(String(sessionId))
+                return { background, busy, lastOutputAt }
             },
             // 额度现状：状态只从 state 来；detail 给出口说额度用完、用量提醒要的补充字段（核心的通用形状）。
             // 执行方不再去调消息渠道：渠道自己在一轮结束和定时器上看（执行方不依赖渠道）。

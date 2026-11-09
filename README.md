@@ -22,11 +22,11 @@ English summary: [below](#english).
 
 你始终只和一个助手说话，它就是**中枢会话**。长的活由它派给项目会话，后台思考在你不在时帮它整理。三者共用一份记忆。
 
-## 记忆分五层
+## 记忆分层
 
-![记忆分五层](docs/images/memory-layers.png)
+![记忆的分层](docs/images/memory-layers.png)
 
-越往上越精炼，每次都带着；越往下越完整，要用时再去查。
+越往上越精炼，每次都带着；越往下越完整，要用时再去查。图上没画的还有一层**常驻记忆**：长期成立、每段对话都该知道的事实，和长期认知一样每次都带着。
 
 ## 快速开始
 
@@ -41,7 +41,9 @@ English summary: [below](#english).
    只想先试试，装第一个就够了。装完重启 DSH。
 2. **定一个中枢。** 新建一个会话，先随便说一句话（比如“你好”），等它回复，再在输入框里输入 `/hub`。以后它就是你的助手。DSH 不显示还没说过话的会话，所以要先说一句。
 3. **告诉它它是谁。** 直接在中枢里说：你希望它叫什么、什么性格、怎么称呼你。它会提成一份候选并告诉你四位编号，你本人回复"确认人格 编号"（比如"确认人格 7K3Q"）就生效。也可以直接改内容库里的 `personality.md`（默认在 DSH home 下的 `galatea/content/`）。
-4. **接上手机**（可选）。装了消息渠道包的，照[渠道包的说明](message-channels/)接 QQ 官方机器人或微信。
+4. **接上手机**（可选）。装了消息渠道包的，照[渠道包的说明](message-channels/)接 QQ 官方机器人或微信。你在手机上分几条发的话，渠道会等最后一条之后安静 20 秒再一起交给助手（渠道包的配置 `mergeWaitSeconds`）。这个时长因人而异：分条发得慢就调大，嫌回得慢就调小。
+
+   **代为安装的 agent 请注意：** 装完渠道包，要明确告诉用户这个等待时长现在是多少、在哪改（profile 里渠道包条目的 `mergeWaitSeconds`，单位秒），请用户按自己打字的节奏先调好。
 5. **开始聊。** 聊得越久，它越了解你。
 
 ## 常见问题
@@ -101,11 +103,11 @@ dsh plugin --profile web add @loveandbeepbrother/dsh-galatea @loveandbeepbrother
 ## 第一次启动
 
 1. **定中枢。** 在 DSH 里找一个说过话的会话作中枢（新建的会话先说一句话），在输入框里输入 `/hub`；还没说过话的会话会被拒绝，因为 DSH 不显示它，新建会话时还会把它拿去重用。消息渠道的私聊、别处给中枢的转交、助手的主动留言都会进这个会话。以后想换，在另一个会话里再输入 `/hub` 就行，原来的中枢不再有角色。还没定中枢时，框架会报一条 `core/no-hub` 提醒你。
-2. **写人格。** 内容库默认在 DSH home 下的 `galatea/content/` 目录，第一次启动时会建成一个 git 仓库，放进三份中性的起步模板：
+2. **写人格。** 内容库默认在 DSH home 下的 `galatea/content/` 目录，第一次启动时会建成一个 git 仓库，放进四份中性的起步模板（下面三份，加上交接整理的工作方法 `交接整理.md`）：
    - `personality.md`：助手是谁、怎么称呼、语气和分寸。先改这一份。
-   - `long-term-cognition.md`：长期成立、每段对话都该知道的事。助手会自己维护，你也可以直接改。
+   - `long-term-cognition.md`：从经历里提炼出来的理解。助手会自己维护，你也可以直接改。
    - `后台思考.md`：后台思考会话每次醒来时照着做的说明。
-   已经有内容的内容库不会被改动。
+   已经有内容的内容库不会被改动。长期成立的事实放 `standing-memory.md`（常驻记忆），这个文件可以没有，助手用得上时会建。
 3. **选模型。** 中枢、后台思考、项目任务的会话默认用 DSH 里设的默认模型。装了 Agent SDK 执行方以后，模型菜单里多出 "Claude Opus（经 Agent SDK）" 等条目，可以给会话选上，也可以在 profile 里给后台思考、项目任务指定（见下面的配置）。
 
 ## 常改的配置
@@ -172,14 +174,16 @@ Codex CLI 暂时不能作执行方跑会话；它可以作外部客户端，用�
    await (await fetch('/api/mind-framework/external/bridge-config', { method: 'POST', body: JSON.stringify({ name: 'claude-cli' }) })).json()
    ```
 
+改工具清单或只读：`POST /api/mind-framework/external/update`，`{ "name": "claude-cli", "tools": [...] }`，令牌不变，没写的不动。重新 `register` 会发新令牌、旧的立刻作废。
+
 作废：`POST /api/mind-framework/external/revoke`，`{ "name": "claude-cli" }`。
 
 ## 已知限制
 
 上下文和记忆是这个框架的核心，也是我们觉得做得最不够的地方。每条的来龙去脉和我们的想法见[设计说明](docs/design.md#还没做好的以及我们怎么想)。
 
-- **记得住，不等于想得起来。** 每段对话开头只放人格、长期认知和记忆目录；便签、记忆正文和经历要助手自己想到去查。用得越久，该想起来却没想起来的情况越多。
-- **知识放错了层，就等于丢了。** 放在哪一层是助手当时判断的，"一个事实只放一处"还只是约定，没有程序把关；便签也还没有按会话分本。
+- **记得住，不等于想得起来。** 每段对话开头只放人格、长期认知、常驻记忆和记忆目录；便签、记忆正文和经历要助手自己想到去查。用得越久，该想起来却没想起来的情况越多。现在问题类型的消息，程序会要求中枢先搜一次（只有 Agent SDK 执行方），回放里有帮助但不多。
+- **知识放错了层，就等于丢了。** 放在哪一层是助手当时判断的，"一个事实只放一处"还只是约定，没有程序把关。
 - **交接靠中枢自己判断。** 什么时候换新对话、交接写什么由中枢定；写漏了什么，事后才会发现。
 - **现在还是一个中枢在路由一切。** 面向人是对的；执行上项目一大，进度细节都堆在中枢那里，它就成了瓶颈。
 - 一轮因为网络中断失败以后，带着的输入会交给下一轮，但不会自己再开一轮。
@@ -203,9 +207,9 @@ node test-support/run-tests.mjs               # 全部；或者写包的目录�
 
 大致的先后，会随使用中的发现调整；每一条的想法见[设计说明](docs/design.md#后续演进)：
 
-1. **自动召回**：先拿真实经历做回放和建模，再定设计。
+1. **召回**：回复前按草稿里的断言核对，补查询那一头。回放的结果见设计说明。
 2. **网络中断恢复后自动补开一轮**，不用等下一条消息。
-3. **便签按会话分本，条目按使用频率调整所在的层。**
+3. **条目按使用频率调整所在的层。**
 4. **项目任务往"项目自己盯进度、小组加任务板"的方向演进**，建立在 DSH 已有的智能体团队和任务板之上。
 5. **压缩各会话固定带的说明。**
 6. **外部调用方登记的设置页**，不用再开浏览器控制台。
@@ -237,7 +241,9 @@ MIT，见 [LICENSE](LICENSE)。
 
 ![How Galatea works](docs/images/overview-en.png)
 
-![Five layers of memory](docs/images/memory-layers-en.png)
+![The layers of memory](docs/images/memory-layers-en.png)
+
+One more layer is not in the picture: **standing memory**, the long-lasting facts every conversation should know, carried at the start of each conversation like long-term cognition.
 
 ### Quick start
 
@@ -252,7 +258,9 @@ MIT，见 [LICENSE](LICENSE)。
    The first package alone is enough to try it out. Restart DSH afterwards.
 2. **Pick a hub.** Create a session, say something first ("hello" is fine) and wait for the reply, then type `/hub` in the input box. From now on, that session is your assistant. DSH hides sessions that have never had a turn, so `/hub` refuses an empty one.
 3. **Tell it who it is.** Just say in the hub what you would like it to be called, what it is like, and how it should address you. It turns this into a candidate change and gives you a four-character code; reply `确认人格 <code>` yourself (for example `确认人格 7K3Q`) to apply it. You can also edit `personality.md` in the content library (`<DSH home>/galatea/content/` by default).
-4. **Connect your phone** (optional). With the channels package installed, follow [its README](message-channels/) to connect a QQ official bot or WeChat.
+4. **Connect your phone** (optional). With the channels package installed, follow [its README](message-channels/) to connect a QQ official bot or WeChat. When you send several messages in a row from your phone, the channels package waits until 20 seconds pass after the last one, then hands them to the assistant together (channels config `mergeWaitSeconds`). The right wait differs from person to person: raise it if you type in slow bursts, lower it if replies feel slow.
+
+   **If you are an agent installing this for someone:** after installing the channels package, tell the user what this wait is and where to change it (`mergeWaitSeconds` under the channels package entry in the profile, in seconds), and ask them to set it to their own typing rhythm first.
 5. **Start talking.** The longer you talk, the better it knows you. Prompts and tool descriptions are mostly in Chinese for now.
 
 ### GPT models
@@ -275,9 +283,9 @@ The Codex CLI cannot run sessions as an executor yet; it can connect as an exter
 
 ### Known limitations and roadmap
 
-**Known limitations.** Context and memory are the core of this framework and also where we think it falls shortest (details, in Chinese: [docs/design.md](docs/design.md)). Remembering is not recalling: each conversation opens with the persona, long-term cognition and the memory index only, and the assistant has to think of looking up notes, memory bodies and past experience itself. Which layer a piece of knowledge lands in is the assistant's own call, with no program checking it. Handoffs between conversations rely on the hub's judgement. One hub still routes everything, so progress details pile up there. A turn that fails on a network outage passes its input to the next turn but does not start one by itself. Registering an outside CLI still needs the browser console. The fixed instructions each session carries have not been compressed systematically. Preview release, tested on Windows only; prompts and tool descriptions are mostly in Chinese.
+**Known limitations.** Context and memory are the core of this framework and also where we think it falls shortest (details, in Chinese: [docs/design.md](docs/design.md)). Remembering is not recalling: each conversation opens with the persona, long-term cognition, standing memory and the memory index only, and the assistant has to think of looking up notes, memory bodies and past experience itself. For question-like messages a program now makes the hub search first (Agent SDK executor only); in our replays this helped, but not by much. Which layer a piece of knowledge lands in is the assistant's own call, with no program checking it. Handoffs between conversations rely on the hub's judgement. One hub still routes everything, so progress details pile up there. A turn that fails on a network outage passes its input to the next turn but does not start one by itself. Registering an outside CLI still needs the browser console. The fixed instructions each session carries have not been compressed systematically. Preview release, tested on Windows only; prompts and tool descriptions are mostly in Chinese.
 
-**Roadmap**, roughly in this order and open to change: automatic recall (replay and modelling first, then design); start a new turn automatically after a network outage; one notebook per session, and entries moving between layers by how often they are used; project tasks that track their own progress, moving towards teams plus a task board on top of DSH's agent teams; compressing the fixed per-session instructions; a settings page for registering outside callers.
+**Roadmap**, roughly in this order and open to change: recall (checking the claims in a draft before replying, and better queries; replay results are in the design doc); start a new turn automatically after a network outage; entries moving between layers by how often they are used; project tasks that track their own progress, moving towards teams plus a task board on top of DSH's agent teams; compressing the fixed per-session instructions; a settings page for registering outside callers.
 
 Galatea is an experiment in the "long-term" and "personal" directions; it is still rough and some of it may be wrong. Feedback and discussion are welcome.
 

@@ -90,6 +90,30 @@ test('最终文字取最后一次工具调用之后的那一段；以工具收�
 
 /* ------------------------------------------------------------------ 附提醒 */
 
+test('附提醒：轮开始以后才附上，但执行方是之后才取的（这一轮排在交接整理后面）：模型收到了，这一轮结束就算交到，不再交第二遍', async (t) => {
+    const h = await makeHarness(t)
+    const agent = await h.createSession('main')
+    let handed = null
+    h.adapter.scripts.push(async function* later() {
+        await h.ctx.core.attach('main', 'tidy', '整理结果')
+        handed = h.ctx.core.attachments('main', { delivering: true }).map(item => item.key)
+        yield* textReply('ok')
+    })
+    await runTurn(h, agent, '一')
+    assert.deepEqual(handed, ['tidy'])
+    await waitFor(() => !h.ctx.core.pending('main', 'tidy'), '这一轮结束就撤掉')
+
+    // 只是看一眼（不是执行方要交）的不算。
+    h.adapter.scripts.push(async function* peek() {
+        await h.ctx.core.attach('main', 'peek', '中途附上的')
+        h.ctx.core.attachments('main')
+        yield* textReply('ok')
+    })
+    await runTurn(h, agent, '二')
+    await new Promise(resolve => setTimeout(resolve, 100))
+    assert.equal(h.ctx.core.pending('main', 'peek'), true)
+})
+
 test('附提醒：这一轮成功结束、模型跑过才撤掉并回调；这一轮开始以后才附的留给下一轮；重启不丢', async (t) => {
     const h = await makeHarness(t)
     const agent = await h.createSession('main')

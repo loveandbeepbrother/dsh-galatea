@@ -69,7 +69,7 @@ test('baseHash 对不上就拒绝、什么都不改；同一版本的两次写�
     await assert.rejects(content.write([{ path: '.git/config', text: 'x', baseHash: null }], { message: 'x', by: BY }), /跳出了内容库/)
 })
 
-test('用户手改过的文件，写之前先以用户身份提交一次', async (t) => {
+test('工具外改过的文件，写之前先单独提交一次，写明是工具外改动', async (t) => {
     const h = await makeHarness(t)
     const { content } = h.ctx.core
     const { hashes } = await content.write([{ path: 'memories/a.md', text: '原来的', baseHash: null }], { message: '写记忆', by: BY })
@@ -79,7 +79,7 @@ test('用户手改过的文件，写之前先以用户身份提交一次', async
     await content.write([{ path: 'memories/a.md', text: '助手再改', baseHash: userHash }], { message: '再改', by: BY })
     const log = gitLog(content.root, '-3').split(/\r?\n/).filter(line => line.includes('|'))
     assert.match(log[0], /^助手\|再改/)
-    assert.ok(log.some(line => /^用户\|用户编辑：memories\/a\.md/.test(line)), '用户的改动单独提交')
+    assert.ok(log.some(line => /^工具外改动|工具外改动：memories\|用户编辑：memories\/a\.md/.test(line)), '工具外的改动单独提交')
 })
 
 test('提交失败就用原始字节退回、退暂存区；没有提交', async (t) => {
@@ -88,7 +88,7 @@ test('提交失败就用原始字节退回、退暂存区；没有提交', async
     const { hashes } = await content.write([{ path: 'personality.md', text: '人格 v1\r\n带 CRLF 的原字节', baseHash: null }], { message: '一', by: BY })
     const head = () => execFileSync('git', ['-C', content.root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
     const before = head()
-    await writeFile(join(content.root, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\necho hook-rejects >&2\nexit 1\n')
+    await writeFile(join(content.root, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\necho hook-rejects >&2\nexit 1\n', { mode: 0o755 })
     await assert.rejects(content.write([{ path: 'personality.md', text: '人格 v2', baseHash: hashes['personality.md'] }], { message: '二', by: BY }), /提交失败，文件已退回/)
     assert.equal(hashOf(await readFile(join(content.root, 'personality.md'))), hashes['personality.md'], '原始字节退回，baseHash 还对得上')
     assert.equal(head(), before)
@@ -127,7 +127,7 @@ test('没有配置内容目录：内容库的调用都报错，启动时报一�
     assert.ok(h.warnings.some(line => line.includes('core/content-unavailable')))
 })
 
-test('中文名、带空格的文件：用户手改以后再写，照样先以用户身份提交', async (t) => {
+test('中文名、带空格的文件：工具外改过以后再写，照样先单独提交', async (t) => {
     const h = await makeHarness(t)
     const { content } = h.ctx.core
     const path = '记忆/我的 便签.md'
@@ -138,5 +138,20 @@ test('中文名、带空格的文件：用户手改以后再写，照样先以�
     assert.notEqual(written.hashes[path], hashes[path])
     const log = gitLog(content.root, '-3').split(/\r?\n/).filter(line => line.includes('|'))
     assert.match(log[0], /^助手\|再改/)
-    assert.ok(log.some(line => line.startsWith('用户|用户编辑：记忆/我的 便签.md')), '用户的改动单独提交')
+    assert.ok(log.some(line => line.startsWith('工具外改动|工具外改动：记忆/我的 便签.md')), '工具外的改动单独提交')
+})
+
+test('工具以外改的、新放进来的文件：sweep 提交，写明是工具外改动；中文文件名写得清楚；忽略的不进；没有改动不提交', async (t) => {
+    const root = await mkdtemp(join(tmpdir(), 'content-sweep-'))
+    t.after(() => rm(root, { recursive: true, force: true }))
+    const content = createContent({ root, starter: {} })
+    await content.write([{ path: 'a.md', text: '原文', baseHash: null }], { message: '写一个', by: { kind: 'program', plugin: 'test' } })
+    await writeFile(join(root, 'a.md'), '手改过')
+    await writeFile(join(root, '交接整理.md'), '新放进来的模板')
+    await writeFile(join(root, '后台思考.md.bak-20260301'), '备份')
+    assert.deepEqual((await content.sweep()).paths.sort(), ['a.md', '交接整理.md'].sort())
+    const subject = execFileSync('git', ['-C', root, 'log', '-1', '--format=%an|%s'], { encoding: 'utf8' }).trim()
+    assert.match(subject, /^工具外改动\|工具外改动：/)
+    assert.equal(execFileSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8' }).trim(), '')
+    assert.deepEqual((await content.sweep()).paths, [])
 })

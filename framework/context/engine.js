@@ -358,7 +358,7 @@ export class MindCompactionEngine extends BasicCompactionEngine {
             .catch(error => this.ctx.core.report('context/boundary-landed-failed', { sessionId, text: `执行方 ${executor.id} 没接住落下的边界（${messageOf(error)}）` }))
     }
 
-    async newConversation(sessionId, document, { onSwitched } = {}) {
+    async newConversation(sessionId, document, { onSwitched, ready } = {}) {
         let text
         try {
             text = (await readFile(document, 'utf8')).trim()
@@ -366,7 +366,10 @@ export class MindCompactionEngine extends BasicCompactionEngine {
             return { scheduled: false, reason: `交接文档读不到：${messageOf(error)}` }
         }
         if (text === '') return { scheduled: false, reason: '交接文档是空的' }
-        this.schedule(sessionId, { kind: 'boundary', boundary: 'handoff', native: true, document, text: `${HANDOFF_LEAD}（${document}）\n\n${text}`, onSwitched })
+        // 交接之前的整理跑完再落边界。
+        const land = () => this.schedule(sessionId, { kind: 'boundary', boundary: 'handoff', native: true, document, text: `${HANDOFF_LEAD}（${document}）\n\n${text}`, onSwitched })
+        if (ready === undefined) land()
+        else Promise.resolve(ready).then(land, land)
         return { scheduled: true }
     }
 
@@ -455,6 +458,11 @@ export class MindCompactionEngine extends BasicCompactionEngine {
     }
 
     async land(agent, sessionId, job) {
+        if (job.kind === 'boundary' && job.native === true && job.document !== undefined) {
+            // 交接之前的整理可能往文档后面补过：落边界时再读。
+            const current = await readFile(job.document, 'utf8').then(value => value.trim()).catch(() => '')
+            if (current !== '') job.text = `${HANDOFF_LEAD}（${job.document}）\n\n${current}`
+        }
         if (job.kind === 'boundary') this.landing.set(sessionId, job)
         try {
             return { result: await this.compactNow(agent, new AbortController().signal) }

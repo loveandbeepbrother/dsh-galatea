@@ -5,7 +5,7 @@
  */
 
 /** 框架自带的起步模板（中性，不写死人设）；用户内容目录里有自己的模板时用那一份。和新建内容库时写进去的是同一份（`starter.js`）。 */
-export { REFLECTION_TEMPLATE as STARTER_TEMPLATE } from '../starter.js'
+export { REFLECTION_TEMPLATE as STARTER_TEMPLATE, TIDY_TEMPLATE } from '../starter.js'
 
 /** 给后台思考看的时刻，按核心的时区写（不用进程本地时区）。 */
 const clockIn = timezone => time => new Date(time).toLocaleString('zh-CN', { hour12: false, timeZone: timezone })

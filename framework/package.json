@@ -1,109 +1,111 @@
 {
-    "name": "@loveandbeepbrother/dsh-galatea",
-    "version": "0.1.0-preview.4",
-    "description": "Galatea: a memory-and-persona framework for DeepSeek Harness — session roles, message provenance and reply routing, a persona and long-term memory kept as a git-versioned folder, an experience archive across sessions, background reflection, continuous work, and an MCP endpoint for outside agents. 记忆与人格框架。",
-    "keywords": [
-        "dsh-plugin",
-        "dsh",
-        "deepseek-harness",
-        "memory",
-        "persona",
-        "personal-assistant",
-        "agent",
-        "mcp"
-    ],
-    "license": "MIT",
-    "homepage": "https://github.com/loveandbeepbrother/dsh-galatea/tree/main/framework#readme",
-    "repository": {
-        "type": "git",
-        "url": "git+https://github.com/loveandbeepbrother/dsh-galatea.git",
-        "directory": "framework"
-    },
-    "bugs": {
-        "url": "https://github.com/loveandbeepbrother/dsh-galatea/issues"
-    },
-    "type": "module",
-    "main": "./core/index.js",
-    "exports": {
-        ".": "./core/index.js",
-        "./core": "./core/index.js",
-        "./package.json": "./package.json",
-        "./context": "./context/index.js",
-        "./context/engine": "./context/engine.js",
-        "./mind": "./mind/index.js",
-        "./memory": "./memory/index.js",
-        "./embedder": "./embedder/index.js",
-        "./experience": "./experience/index.js",
-        "./reflection": "./reflection/index.js",
-        "./work": "./work/index.js",
-        "./external": "./external/index.js",
-        "./external/bridge": "./external/bridge.mjs"
-    },
-    "files": [
-        "README.md",
-        "context/*.js",
-        "cordis.patch.yml",
-        "core/*.js",
-        "embedder/*.js",
-        "experience/*.js",
-        "external/*.js",
-        "external/*.mjs",
-        "memory/*.js",
-        "mind/*.js",
-        "reflection/*.js",
-        "work/*.js",
-        "starter.js",
-        "LICENSE"
-    ],
-    "engines": {
-        "node": ">=24.9.0",
-        "dsh": ">=0.2.2-rc.1 <0.3.0-0"
-    },
-    "dsh": {
-        "bundle": {
-            "patch": "./cordis.patch.yml"
-        }
-    },
-    "scripts": {
-        "test": "node --test test/*.test.mjs"
-    },
-    "dependencies": {
-        "zod": "4.4.3"
-    },
-    "devDependencies": {
-        "@deepseek-ai/cordis": ">=4.0.5",
-        "@deepseek-ai/dsh-app-boot": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-base": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-commands": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-compaction": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-compaction-basic": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-goal": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-goal-round-driver": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-session": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-storage-domain": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-token-meter": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-tool-executor-native": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-tool-goal": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-web-app": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/schemastery": ">=3.18.5"
-    },
-    "peerDependencies": {
-        "@deepseek-ai/cordis": ">=4.0.5",
-        "@deepseek-ai/dsh-commands": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-compaction": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-compaction-basic": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-goal": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-home-paths": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-session": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-storage-domain": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-tool-executor-native": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0-0",
-        "@deepseek-ai/schemastery": ">=3.18.5"
-    },
-    "publishConfig": {
-        "access": "public"
+  "name": "@loveandbeepbrother/dsh-galatea",
+  "version": "0.1.0-preview.4",
+  "description": "Galatea: a memory-and-persona framework for DeepSeek Harness — session roles, message provenance and reply routing, a persona and long-term memory kept as a git-versioned folder, an experience archive across sessions, background reflection, continuous work, and an MCP endpoint for outside agents. 记忆与人格框架。",
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "deepseek-harness",
+    "memory",
+    "persona",
+    "personal-assistant",
+    "agent",
+    "mcp"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/loveandbeepbrother/dsh-galatea/tree/main/framework#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/loveandbeepbrother/dsh-galatea.git",
+    "directory": "framework"
+  },
+  "bugs": {
+    "url": "https://github.com/loveandbeepbrother/dsh-galatea/issues"
+  },
+  "type": "module",
+  "main": "./core/index.js",
+  "exports": {
+    ".": "./core/index.js",
+    "./core": "./core/index.js",
+    "./package.json": "./package.json",
+    "./context": "./context/index.js",
+    "./context/engine": "./context/engine.js",
+    "./mind": "./mind/index.js",
+    "./memory": "./memory/index.js",
+    "./embedder": "./embedder/index.js",
+    "./experience": "./experience/index.js",
+    "./reflection": "./reflection/index.js",
+    "./work": "./work/index.js",
+    "./external": "./external/index.js",
+    "./external/bridge": "./external/bridge.mjs",
+    "./search": "./search/index.js"
+  },
+  "files": [
+    "README.md",
+    "context/*.js",
+    "cordis.patch.yml",
+    "core/*.js",
+    "embedder/*.js",
+    "experience/*.js",
+    "external/*.js",
+    "external/*.mjs",
+    "memory/*.js",
+    "mind/*.js",
+    "reflection/*.js",
+    "search/*.js",
+    "work/*.js",
+    "starter.js",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=24.9.0",
+    "dsh": ">=0.2.2-rc.1 <0.3.0-0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
     }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.5",
+    "@deepseek-ai/dsh-app-boot": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-base": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-commands": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-compaction": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-compaction-basic": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-goal": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-goal-round-driver": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-session": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-storage-domain": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-token-meter": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-tool-executor-native": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-tool-goal": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-web-app": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/schemastery": ">=3.18.5"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.5",
+    "@deepseek-ai/dsh-commands": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-compaction": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-compaction-basic": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-goal": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-home-paths": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-session": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-storage-domain": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-tool-executor-native": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1 <0.3.0-0",
+    "@deepseek-ai/schemastery": ">=3.18.5"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }

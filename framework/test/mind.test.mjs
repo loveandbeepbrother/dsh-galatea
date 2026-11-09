@@ -5,21 +5,23 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import * as MindModule from '../mind/index.js'
+import { versionIdOf } from '../mind/versions.js'
 import { createUserMessage, makeHarness, waitFor } from './harness.mjs'
 
 const BY = Object.freeze({ kind: 'program', plugin: 'test' })
 
-async function setup(t) {
+async function setup(t, config = {}) {
     const h = await makeHarness(t)
     const content = h.coreConfig.contentDirectory
     await mkdir(content, { recursive: true })
     await writeFile(join(content, 'personality.md'), '我是人格第一版。\n')
     await writeFile(join(content, 'long-term-cognition.md'), '认知第一版。\n')
-    const fiber = await h.ctx.plugin(MindModule, {})
+    const fiber = await h.ctx.plugin(MindModule, config)
     t.after(() => fiber.dispose())
     const agents = {}
     for (const id of ['main', 'work', 'idle']) agents[id] = await h.createSession(id)
@@ -126,7 +128,7 @@ test('别的执行方（Claude Code）开对话时心智段在开头；别处改
 
     const cognition = await call('idle', 'assistant_mind_read', { part: 'cognition' })
     await call('idle', 'assistant_cognition_update', { text: '后台改过的认知。', baseHash: cognition.hash, summary: '后台整理' })
-    assert.deepEqual(await h.ctx.core.segments.changes('cc-conv', 'main'), ['（DSH 提示，不是用户发言）人格或长期认知已由别处更新；需要时用 `assistant_mind_read` 读最新版本。'])
+    assert.deepEqual(await h.ctx.core.segments.changes('cc-conv', 'main'), ['（DSH 提示，不是用户发言）人格、长期认知或常驻记忆已由别处更新；需要时用 `assistant_mind_read` 读最新版本。'])
 
     const mine = await call('main', 'assistant_mind_read', { part: 'cognition' })
     await call('main', 'assistant_cognition_update', { text: '中枢自己改的认知。', baseHash: mine.hash, summary: '自己整理' })
@@ -154,4 +156,96 @@ test('人格文件不存在按空处理，报一次写明是哪个文件；文�
     await rm(join(content, '配错的', '人格.md'))
     await h.ctx.mind.read('persona')
     assert.equal(missing().length, 2, '有了以后再没了再报')
+})
+
+test('常驻记忆是可选的一层：没有文件按空、不报异常；中枢写了从下一轮生效，放在长期认知后面，这一轮还是原来的版本', async (t) => {
+    const { h, content, turn, call, lastRequest } = await setup(t)
+    const reports = []
+    h.ctx.core.onReport(item => reports.push(item))
+    await turn('main', '你好')
+    assert.deepEqual(reports.filter(item => item.kind === 'mind/file-missing'), [])
+    const empty = await call('main', 'assistant_mind_read', { part: 'standing' })
+    assert.deepEqual(empty, { file: 'standing-memory.md', hash: null, text: '' })
+
+    const written = await call('main', 'assistant_standing_update', { text: '事实第一版。', baseHash: '', summary: '开始记' })
+    assert.ok(written.commit !== undefined)
+    assert.equal(await readFile(join(content, 'standing-memory.md'), 'utf8'), '事实第一版。\n')
+    const firstTurn = (await h.events('main')).find(event => event.type === 'turn/start')
+    assert.equal((await h.ctx.mind.snapshot('main', { turn: firstTurn.seq })).standing, '', '已经绑定的那一轮不变')
+
+    await turn('main', '再来')
+    const request = lastRequest()
+    assert.ok(request.includes('事实第一版。'))
+    assert.ok(request.indexOf('认知第一版。') < request.indexOf('事实第一版。'), '在长期认知之后')
+    const read = await call('main', 'assistant_mind_read', { part: 'standing' })
+    assert.equal(read.text, '事实第一版。\n')
+    const stale = await call('main', 'assistant_standing_update', { text: '第二版。', baseHash: '', summary: '用旧哈希' })
+    assert.match(stale.error, /常驻记忆在你读取以后已经变了[\s\S]*事实第一版/)
+})
+
+test('谁能写常驻记忆：中枢和后台思考写，不走候选；工作会话只读；外部调用方只读', async (t) => {
+    const { call } = await setup(t)
+    const workTools = await call('work', null)
+    assert.ok(workTools.includes('assistant_mind_read') && !workTools.includes('assistant_standing_update'))
+    assert.ok((await call('idle', null)).includes('assistant_standing_update'))
+    const read = await call('idle', 'assistant_mind_read', { part: 'standing' })
+    const written = await call('idle', 'assistant_standing_update', { text: '后台记的事实。', baseHash: read.hash ?? '', summary: '补一条' })
+    assert.equal(written.candidate, undefined, '改了就是事实变了，不走候选')
+    assert.equal((await call('work', 'assistant_mind_read', { part: 'standing' })).text, '后台记的事实。\n')
+    assert.equal(MindModule.permissions({ kind: 'external', name: 'cli', readOnly: false }).standing, false)
+    assert.equal(MindModule.permissions({ kind: 'external', name: 'cli', readOnly: false }).read, true)
+    assert.equal(MindModule.permissions({ kind: 'session', role: 'worker' }).standing, false)
+    assert.equal(MindModule.permissions({ kind: 'session', role: 'hub' }).standing, true)
+})
+
+test('常驻记忆的篇幅：默认 3000 字，超了照样写，返回值里写明；上限可配，0 不限', async (t) => {
+    const { content, call } = await setup(t)
+    const long = '事'.repeat(3001)
+    const over = await call('main', 'assistant_standing_update', { text: long, baseHash: '', summary: '很长' })
+    assert.match(over.note, /超出篇幅上限 3000 字（现在 3001 字），已照样写入/)
+    assert.equal((await readFile(join(content, 'standing-memory.md'), 'utf8')).trim(), long)
+    const read = await call('main', 'assistant_mind_read', { part: 'standing' })
+    assert.equal((await call('main', 'assistant_standing_update', { text: '事'.repeat(3000), baseHash: read.hash, summary: '压回去' })).note, undefined)
+})
+
+test('常驻记忆的文件名和上限是配置', async (t) => {
+    const { content, call } = await setup(t, { standingFile: 'facts.md', standingMaxChars: 2 })
+    const over = await call('main', 'assistant_standing_update', { text: '三个字', baseHash: '', summary: '试试' })
+    assert.match(over.note, /超出篇幅上限 2 字/)
+    assert.equal(await readFile(join(content, 'facts.md'), 'utf8'), '三个字\n')
+    assert.equal((await call('main', 'assistant_mind_read', { part: 'standing' })).file, 'facts.md')
+})
+
+test('别处改了常驻记忆：别的执行方下一轮只收到一句；开新对话（交接、切模型）带上最新的；自己改的不提', async (t) => {
+    const { h, call } = await setup(t)
+    await h.ctx.core.segments.open('cc-conv', 'main')
+    await call('idle', 'assistant_standing_update', { text: '后台记的事实。', baseHash: '', summary: '补一条' })
+    assert.deepEqual(await h.ctx.core.segments.changes('cc-conv', 'main'), ['（DSH 提示，不是用户发言）人格、长期认知或常驻记忆已由别处更新；需要时用 `assistant_mind_read` 读最新版本。'])
+    const read = await call('main', 'assistant_mind_read', { part: 'standing' })
+    await call('main', 'assistant_standing_update', { text: '中枢改的事实。', baseHash: read.hash, summary: '自己改' })
+    assert.deepEqual(await h.ctx.core.segments.changes('cc-conv', 'main'), [], '自己改的不提')
+    const opening = await h.ctx.core.segments.open('cc-conv-2', 'main')
+    assert.ok(opening.find(entry => entry.name === MindModule.SEGMENT).text.includes('中枢改的事实。'))
+})
+
+test('还没用常驻记忆的版本，编号和以前一样；用了以后编号不同', () => {
+    const legacy = createHash('sha256').update('p\u0000c').digest('hex').slice(0, 32)
+    assert.equal(versionIdOf('p', 'c'), legacy, '存着的旧版本照常核对得过')
+    assert.notEqual(versionIdOf('p', 'c', 's'), legacy)
+})
+
+test('存储里没有常驻记忆字段的旧版本照常读：绑定它的那一轮常驻记忆是空的', async (t) => {
+    const { h, content, turn, call } = await setup(t)
+    await writeFile(join(content, 'personality.md'), '旧版本的人格。\n')
+    await turn('main', '第一轮')
+    const firstTurn = (await h.events('main')).find(event => event.type === 'turn/start')
+    const old = await h.ctx.mind.snapshot('main', { turn: firstTurn.seq })
+    assert.equal(old.standing, '')
+    await call('main', 'assistant_standing_update', { text: '有了事实。', baseHash: '', summary: '开始记' })
+    await turn('main', '第二轮')
+    const second = (await h.events('main')).filter(event => event.type === 'turn/start').at(-1)
+    const now = await h.ctx.mind.snapshot('main', { turn: second.seq })
+    assert.equal(now.standing, '有了事实。\n')
+    assert.notEqual(now.versionId, old.versionId)
+    assert.equal(now.persona, old.persona, '另外两份没变')
 })

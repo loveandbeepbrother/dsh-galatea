@@ -6,7 +6,8 @@
  * @module @loveandbeepbrother/dsh-galatea-agent-sdk/transcript
  */
 
-import { open } from 'node:fs/promises'
+import { open, readdir, stat } from 'node:fs/promises'
+import { join } from 'node:path'
 
 /** 只记这些参数：路径、编号、地址、查询与命令开头；正文类参数（content、text、message……）一律不记。 */
 const KEY_ARGS = /^(file_path|notebook_path|path|pattern|url|query|to|description|subagent_type|document|ref|sessionId|projectId|taskId|noteId|memoryId|id|command)$|Id$/
@@ -79,11 +80,68 @@ function describeOp(name, args, resultIds = []) {
 const awaited = call => call.op.tool === 'SendMessage' || /^assistant_/.test(call.op.tool)
 /** 等结果最多等这么久（按记录里最新的时间算）：中断后永远没有结果的调用不能把续读位置一直拖住。 */
 const STALE_CALL_MS = 3_600_000
+/** 会话间转话（渠道的 assistant_session_send）结果末尾的关联编号，接收方的条目带着同一个（渠道包的 assistant_session_send 这样写）。 */
+const SESSION_SEND_LINK = /（编号 ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})）$/
 
 /**
  * DSH 里那个 Claude Code 进程的记录：只取发给别的会话的消息、压缩边界与操作（其余已在 DSH 会话事件里）。
  * 结果还没写进记录的 `SendMessage` 与助手工具（派任务的结果带任务编号）留到下次：`resume.offset` 停在最早一个还没有结果的调用。
  */
+/** 看一份记录有没有停在一轮中途时读尾巴的多少字节。 */
+const TAIL_BYTES = 256 * 1024
+
+/**
+ * 这份记录是不是停在一轮中途：最后一条说话的条目是用户那边（输入、工具结果），或者助手要调工具。
+ * 正常结束的一轮停在助手的 `end_turn` 上（后面可能还有钩子的系统条目，不算）。
+ */
+export function turnLeftOpen(lines) {
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+        let entry
+        try {
+            entry = JSON.parse(lines[index])
+        } catch {
+            continue
+        }
+        if (entry?.isSidechain === true) continue
+        if (entry?.type === 'assistant') return entry.message?.stop_reason !== 'end_turn'
+        if (entry?.type === 'user') return true
+    }
+    return false
+}
+
+/**
+ * 上次重启打断的轮：`since` 到 `until` 之间写过、归某个会话、又停在一轮中途的记录。
+ * DSH 的日志看不到 Claude Code 自己开的一轮（后台任务结束时），Host 正常退出也不留失败记录，所以看记录本身。
+ * @param options.owners - Claude Code 对话编号 → `{ sessionId }`。
+ * @returns `[{ sessionId, conversation, at }]`。
+ */
+export async function interruptedTurns({ root, since, until, owners }) {
+    const found = []
+    for (const project of await readdir(root, { withFileTypes: true }).catch(() => [])) {
+        if (!project.isDirectory()) continue
+        for (const file of await readdir(join(root, project.name)).catch(() => [])) {
+            if (!file.endsWith('.jsonl')) continue
+            const conversation = file.slice(0, -'.jsonl'.length)
+            const sessionId = owners.get(conversation)?.sessionId
+            if (sessionId === undefined) continue
+            const path = join(root, project.name, file)
+            const { mtimeMs, size } = await stat(path)
+            if (mtimeMs < since || mtimeMs > until) continue
+            // 只读尾巴：一条记录可能很长，留够几条。
+            const handle = await open(path, 'r')
+            try {
+                const length = Math.min(size, TAIL_BYTES)
+                const { buffer } = await handle.read(Buffer.alloc(length), 0, length, size - length)
+                const lines = buffer.toString('utf8').split(/\r?\n/).filter(Boolean)
+                if (turnLeftOpen(lines)) found.push({ sessionId, conversation, at: mtimeMs })
+            } finally {
+                await handle.close()
+            }
+        }
+    }
+    return found
+}
+
 export function createProcessParser({ claudeSessionId }) {
     const entries = []
     const ops = []
@@ -140,6 +198,13 @@ export function createProcessParser({ claudeSessionId }) {
                     text: String(call.input.message ?? call.input.content ?? ''),
                 })
             } else {
+                // 会话间转话（渠道的 assistant_session_send）：结果末尾写着关联编号，接收方的条目带着同一个。
+                const sent = /assistant_session_send$/.test(call.op.tool) ? SESSION_SEND_LINK.exec(text.trim()) : null
+                if (sent !== null) {
+                    call.op.link = sent[1]
+                    call.op.detail = `${call.op.detail} → ${sent[1]}`.trim()
+                    continue
+                }
                 const ids = idsOfResult(text)
                 if (ids.length > 0 && /^assistant_/.test(call.op.tool)) {
                     call.op.detail = `${call.op.detail} → ${ids.join(', ')}`.trim()

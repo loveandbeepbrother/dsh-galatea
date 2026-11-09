@@ -1,5 +1,5 @@
 /**
- * 心智模块：人格、长期认知，人格候选与确认。提供服务 `mind`、上下文段 `mind`、四个工具。
+ * 心智模块：人格、长期认知、常驻记忆、“我们之间”，人格候选与确认。提供服务 `mind`、上下文段 `mind` 和 `between-us`、六个工具。
  *
  * - 文件都在核心的内容库里（`core.content`），写入的顺序、留痕、用户手改的提交由内容库做；路径是配置。
  * - **按轮固定版本**：每个会话每一轮用同一个版本，写入从下一轮生效。找版本的顺序：这一轮的绑定 → 没完成的 Goal
@@ -8,12 +8,17 @@
  *   下一轮生效，并报一条 `mind/suppressed-open-turn`。
  * - **谁能写**（默认配置，用工具的 `allow` 实现，不能写的工具不列给它）：
  *   人格——中枢写，稳定变化要用户本人确认；后台思考、外部调用方只能提候选；工作会话不能。
- *   长期认知——中枢、后台思考、外部调用方写；工作会话不能。确认、撤回候选只有中枢。没定角色的会话按工作会话算。
+ *   长期认知——中枢、后台思考、外部调用方写；工作会话不能。常驻记忆——中枢、后台思考写，改了就是事实变了，不走候选；
+ *   工作会话和外部调用方只读。确认、撤回候选只有中枢。没定角色的会话按工作会话算。
  * - **候选**：不是中枢提的，心智模块自己经 `core.deliver('hub')` 转交中枢，请它向用户确认。
  * - **确认**：调用会话里候选提出以后最近一条用户本人的消息（`core.provenance.latestFromUser`）含确认口令，
  *   人格的哈希还是候选记下的那个；新人格和候选状态在一次 `content.write` 里提交。
+ * - **“我们之间”**：最近的共同经历、用户近来在意的事、彼此的默契和变化（陪伴的连续性，不只是协作规则）。中枢和后台思考写，
+ *   整份替换；单独一段（`between-us`），接在心智段后面，开对话时定下、别处改了提一句。不进按轮固定的版本：版本记录的 schema
+ *   是严格的，加一份要加字段，回退到旧包会读不了新版本。没有这个文件按空，不算异常。
  * - 篇幅上限是配置：超了照样写，返回值里写明。
- * - 文件不存在按空处理，不复制写死的默认人设；按空处理时报一次 `mind/file-missing`，写明是哪个文件。
+ * - 文件不存在按空处理，不复制写死的默认人设；人格、长期认知按空处理时报一次 `mind/file-missing`，写明是哪个文件。
+ *   常驻记忆是可选的一层，没有这个文件不算异常。
  *
  * @module @loveandbeepbrother/dsh-galatea/mind
  */
@@ -28,18 +33,27 @@ export const inject = ['core', 'storageDomain', 'sessionProjections', 'agents']
 
 export const SERVICE = 'mind'
 export const SEGMENT = 'mind'
+export const BETWEEN_SEGMENT = 'between-us'
 /** 转交中枢的人格候选在会话里的来源。 */
 export const CANDIDATE_SOURCE = 'mind-candidate'
-export const MIND_TOOLS = Object.freeze(['assistant_mind_read', 'assistant_persona_update', 'assistant_persona_decide', 'assistant_cognition_update'])
+export const MIND_TOOLS = Object.freeze(['assistant_mind_read', 'assistant_persona_update', 'assistant_persona_decide', 'assistant_cognition_update', 'assistant_standing_update', 'assistant_between_us_update'])
 const WRITES = Object.freeze([SEGMENT])
+const BETWEEN_WRITES = Object.freeze([BETWEEN_SEGMENT])
 const SPEAKER = Object.freeze({ kind: 'program', plugin: name })
+const PART_LABELS = Object.freeze({ persona: '人格', cognition: '长期认知', standing: '常驻记忆', between: '“我们之间”' })
+/** 可以没有的文件：没有按空，不报。 */
+const OPTIONAL_PARTS = new Set(['standing', 'between'])
 
 export const Config = Schema.object({
     personaFile: Schema.string().default('personality.md').description('人格文件（相对内容库）'),
     cognitionFile: Schema.string().default('long-term-cognition.md').description('长期认知文件（相对内容库）'),
+    standingFile: Schema.string().default('standing-memory.md').description('常驻记忆文件（相对内容库）；没有这个文件按空，不算异常'),
     candidatesDirectory: Schema.string().default('candidates').description('人格候选的目录（相对内容库）'),
     personaMaxChars: Schema.natural().default(0).description('人格的篇幅上限（字），超了照样写、返回值里写明；0 不限'),
     cognitionMaxChars: Schema.natural().default(0).description('长期认知的篇幅上限（字）；0 不限'),
+    standingMaxChars: Schema.natural().default(3000).description('常驻记忆的篇幅上限（字），超了照样写、返回值里写明；0 不限'),
+    betweenFile: Schema.string().default('between-us.md').description('“我们之间”的文件（相对内容库）；没有这个文件按空，不算异常'),
+    betweenMaxChars: Schema.natural().default(1000).description('“我们之间”的篇幅上限（字），超了照样写、返回值里写明；0 不限'),
     confirmTemplate: Schema.string().default('确认人格 {code}').description('用户确认人格候选要说的话，{code} 换成候选编号'),
 })
 
@@ -52,12 +66,14 @@ export class MindWriteError extends Error {
 
 /** 某个调用方能做什么（默认配置）。 */
 export function permissions(who) {
-    if (who?.kind === 'external') return { read: true, personaDaily: false, personaCandidate: !who.readOnly, cognition: !who.readOnly, decide: false }
-    if (who?.kind !== 'session') return { read: true, personaDaily: false, personaCandidate: false, cognition: false, decide: false }
+    if (who?.kind === 'external') return { read: true, personaDaily: false, personaCandidate: !who.readOnly, cognition: !who.readOnly, standing: false, between: false, decide: false }
+    if (who?.kind !== 'session') return { read: true, personaDaily: false, personaCandidate: false, cognition: false, standing: false, between: false, decide: false }
     switch (who.role) {
-        case 'hub': return { read: true, personaDaily: true, personaCandidate: true, cognition: true, decide: true }
-        case 'background': return { read: true, personaDaily: false, personaCandidate: true, cognition: true, decide: false }
-        default: return { read: true, personaDaily: false, personaCandidate: false, cognition: false, decide: false }
+        case 'hub': return { read: true, personaDaily: true, personaCandidate: true, cognition: true, standing: true, between: true, decide: true }
+        case 'background': return { read: true, personaDaily: false, personaCandidate: true, cognition: true, standing: true, between: true, decide: false }
+        // 交接整理只管事实：人格、长期认知和“我们之间”不归它，看到要改的告诉中枢。
+        case 'tidy': return { read: true, personaDaily: false, personaCandidate: false, cognition: false, standing: true, between: false, decide: false }
+        default: return { read: true, personaDaily: false, personaCandidate: false, cognition: false, standing: false, between: false, decide: false }
     }
 }
 
@@ -67,7 +83,7 @@ export async function apply(ctx, config) {
     ctx.effect(() => () => domain.close?.(), 'mind-framework-mind: domain')
     const versions = createVersions(domain)
     const phrase = code => config.confirmTemplate.replaceAll('{code}', code)
-    const files = { persona: config.personaFile, cognition: config.cognitionFile }
+    const files = { persona: config.personaFile, cognition: config.cognitionFile, standing: config.standingFile, between: config.betweenFile }
 
     /* ------------------------------------------------------------------ 读文件 */
 
@@ -80,22 +96,23 @@ export async function apply(ctx, config) {
             missingReported.delete(part)
             return read
         }
-        // 文件不存在按空处理不算出错，onError 拦不住；路径配错时段会悄悄变空，所以报出来。
-        if (!missingReported.has(part)) {
+        // 文件不存在按空处理不算出错，onError 拦不住；路径配错时段会悄悄变空，所以报出来。常驻记忆本来就可以没有。
+        if (!OPTIONAL_PARTS.has(part) && !missingReported.has(part)) {
             missingReported.add(part)
-            core.report('mind/file-missing', { text: `${part === 'persona' ? '人格' : '长期认知'}文件 ${files[part]} 不存在，按空处理；路径配错了的话心智段会是空的`, data: { file: files[part] } })
+            core.report('mind/file-missing', { text: `${PART_LABELS[part]}文件 ${files[part]} 不存在，按空处理；路径配错了的话心智段会是空的`, data: { file: files[part] } })
         }
         return { text: '', hash: null }
     }
 
     /** 连读两次一致才用（读的时候可能正被写），最多三次。 */
-    async function readStablePair() {
+    async function readStable() {
+        const readAll = async () => [await readPart('persona'), await readPart('cognition'), await readPart('standing')]
         for (let attempt = 0; attempt < 3; attempt += 1) {
-            const first = [await readPart('persona'), await readPart('cognition')]
-            const second = [await readPart('persona'), await readPart('cognition')]
-            if (first[0].hash === second[0].hash && first[1].hash === second[1].hash) return { persona: second[0].text, cognition: second[1].text }
+            const first = await readAll()
+            const second = await readAll()
+            if (first.every((part, index) => part.hash === second[index].hash)) return { persona: second[0].text, cognition: second[1].text, standing: second[2].text }
         }
-        throw new Error('心智：人格、长期认知一直在变，读不到稳定的一份')
+        throw new Error('心智：人格、长期认知、常驻记忆一直在变，读不到稳定的一份')
     }
 
     /* ------------------------------------------------------------------ 这一轮的版本 */
@@ -169,7 +186,7 @@ export async function apply(ctx, config) {
             }
         }
         // 版本正文先落盘，再写绑定。
-        const record = await versions.ensure(await readStablePair())
+        const record = await versions.ensure(await readStable())
         if (info.goal !== null) await versions.bind(sessionId, 'goal', { ...turn, goalId: info.goal.id }, record.id)
         await versions.bind(sessionId, 'turn', turn, record.id)
         return record
@@ -224,15 +241,24 @@ export async function apply(ctx, config) {
         order: 300,
         audience: 'opening',
         onChange: 'notice',
-        noticeText: '（DSH 提示，不是用户发言）人格或长期认知已由别处更新；需要时用 `assistant_mind_read` 读最新版本。',
+        noticeText: '（DSH 提示，不是用户发言）人格、长期认知或常驻记忆已由别处更新；需要时用 `assistant_mind_read` 读最新版本。',
         // 读不出就不往下跑：没有人格的一轮不该当成正常的一轮。
         onError: 'fail',
         text: async ({ agent }) => {
             // 没有正在跑的一轮（预览、开对话前取开头）：读当前文件，不写绑定。
             const version = agent === undefined ? undefined : await currentVersion(agent)
             if (version === 'suppressed') return ''
-            return composeText(version ?? await readStablePair())
+            return composeText(version ?? await readStable())
         },
+    })
+
+    core.segment({
+        name: BETWEEN_SEGMENT,
+        order: 310,
+        audience: 'opening',
+        onChange: 'notice',
+        noticeText: '（DSH 提示，不是用户发言）“我们之间”已由别处更新；需要时用 `assistant_mind_read`（part "between_us"）读最新版本。',
+        text: async () => (await readPart('between')).text.trim(),
     })
 
     /* ------------------------------------------------------------------ 服务 */
@@ -241,7 +267,7 @@ export async function apply(ctx, config) {
      * 某个会话的版本。
      * @param at - 不给：这个会话正在跑的那一轮（会话要在内存里）；`{ turn }`：那一轮起点的绑定（`turn` 是轮起点的 seq）；
      *   `{ goalId }`、`'session'`：那个绑定。
-     * @returns `{ versionId, persona, cognition }`；启用时那一轮为 `{ suppressed: true }`；没有时为 `null`。
+     * @returns `{ versionId, persona, cognition, standing }`；启用时那一轮为 `{ suppressed: true }`；没有时为 `null`。
      */
     async function snapshot(sessionId, at) {
         const id = String(sessionId)
@@ -258,7 +284,7 @@ export async function apply(ctx, config) {
                     : at?.turn !== undefined ? versions.binding(id, 'turn', at.turn) : undefined
             record = found === undefined ? undefined : versions.load(found.versionId, '绑定')
         }
-        return record === undefined ? null : { versionId: record.id, persona: record.persona, cognition: record.cognition }
+        return record === undefined ? null : { versionId: record.id, persona: record.persona, cognition: record.cognition, standing: record.standing ?? '' }
     }
 
     /** 把一个 Goal 或会话本身固定到某个版本（持续工作用）。 */
@@ -270,7 +296,7 @@ export async function apply(ctx, config) {
     }
 
     async function read(part) {
-        if (!['persona', 'cognition'].includes(part)) throw new TypeError("read 的 part 只能是 persona 或 cognition")
+        if (!Object.hasOwn(files, part)) throw new TypeError("read 的 part 只能是 persona、cognition、standing 或 between")
         return readPart(part)
     }
 
@@ -293,21 +319,22 @@ export async function apply(ctx, config) {
     async function requireBase(part, baseHash) {
         const current = await readPart(part)
         const given = baseHash === '' || baseHash === undefined ? null : baseHash
-        if (given !== current.hash) throw new MindWriteError(`${part === 'persona' ? '人格' : '长期认知'}在你读取以后已经变了，基于下面的当前内容重新改`, current.text)
+        if (given !== current.hash) throw new MindWriteError(`${PART_LABELS[part]}在你读取以后已经变了，基于下面的当前内容重新改`, current.text)
         return current
     }
 
     const withNewline = text => (text.endsWith('\n') ? text : `${text}\n`)
     const overLimit = (text, limit) => (limit > 0 && text.length > limit ? `超出篇幅上限 ${limit} 字（现在 ${text.length} 字），已照样写入；下次整理时压缩一下` : undefined)
 
-    async function updateCognition(args, who) {
+    /** 整份替换长期认知或常驻记忆。 */
+    async function replaceWhole(part, limit, args, who) {
         const text = String(args.text ?? '')
         const summary = String(args.summary ?? '').trim()
         if (summary === '') throw new MindWriteError('summary 不能为空：写明这次整理了什么')
-        const base = await requireBase('cognition', args.baseHash)
-        const written = await core.content.write([{ path: files.cognition, text: withNewline(text), baseHash: base.hash }], { message: `长期认知：${summary}`, by: who })
-        const note = overLimit(text, config.cognitionMaxChars)
-        return { hash: written.hashes[files.cognition] ?? null, commit: written.commit ?? null, ...note === undefined ? {} : { note } }
+        const base = await requireBase(part, args.baseHash)
+        const written = await core.content.write([{ path: files[part], text: withNewline(text), baseHash: base.hash }], { message: `${PART_LABELS[part]}：${summary}`, by: who })
+        const note = overLimit(text, limit)
+        return { hash: written.hashes[files[part]] ?? null, commit: written.commit ?? null, ...note === undefined ? {} : { note } }
     }
 
     async function updatePersona(args, who) {
@@ -396,8 +423,8 @@ export async function apply(ctx, config) {
 
     async function readMind(args) {
         if (args.part === 'candidates') return { pending: await candidates() }
-        const part = { personality: 'persona', cognition: 'cognition' }[args.part]
-        if (part === undefined) throw new MindWriteError('part 只能是 personality、cognition 或 candidates')
+        const part = { personality: 'persona', cognition: 'cognition', standing: 'standing', between_us: 'between' }[args.part]
+        if (part === undefined) throw new MindWriteError('part 只能是 personality、cognition、standing、between_us 或 candidates')
         const current = await readPart(part)
         return { file: files[part], hash: current.hash, text: current.text }
     }
@@ -414,8 +441,8 @@ export async function apply(ctx, config) {
 
     tool({
         name: 'assistant_mind_read',
-        description: 'Read the current personality or long-term cognition with its version hash (needed to update it), or list persona candidates waiting for the user\'s confirmation. part: "personality", "cognition" or "candidates".',
-        parameters: { part: { type: 'string', required: true, description: '"personality", "cognition" or "candidates".' } },
+        description: 'Read the current personality, long-term cognition, standing memory or "between us" with its version hash (needed to update it), or list persona candidates waiting for the user\'s confirmation. part: "personality", "cognition", "standing", "between_us" or "candidates".',
+        parameters: { part: { type: 'string', required: true, description: '"personality", "cognition", "standing", "between_us" or "candidates".' } },
         execute: args => readMind(args),
     }, { effect: 'read' })
     tool({
@@ -446,7 +473,27 @@ export async function apply(ctx, config) {
             baseHash: { type: 'string', required: true, description: 'hash returned by assistant_mind_read for the cognition.' },
             summary: { type: 'string', required: true, description: 'What was added, changed or removed.' },
         },
-        execute: (args, who) => updateCognition(args, who),
+        execute: (args, who) => replaceWhole('cognition', config.cognitionMaxChars, args, who),
     }, { effect: 'write', writesSegments: WRITES, allow: who => permissions(who).cognition })
+    tool({
+        name: 'assistant_standing_update',
+        description: 'Replace the standing memory file (effective from the next turn of every session): long-lasting facts every conversation should know, as opposed to understanding drawn from experience, which belongs in long-term cognition. When a fact changes, update it here directly; no user confirmation is needed. text is the complete new file; baseHash comes from assistant_mind_read (empty when the file does not exist yet); summary says what changed.',
+        parameters: {
+            text: { type: 'string', required: true, description: 'Complete new standing memory text.' },
+            baseHash: { type: 'string', required: true, description: 'hash returned by assistant_mind_read for the standing memory; empty when it does not exist yet.' },
+            summary: { type: 'string', required: true, description: 'What was added, changed or removed.' },
+        },
+        execute: (args, who) => replaceWhole('standing', config.standingMaxChars, args, who),
+    }, { effect: 'write', writesSegments: WRITES, allow: who => permissions(who).standing })
+    tool({
+        name: 'assistant_between_us_update',
+        description: 'Replace "between us" (effective from the next conversation of every session): recent shared experiences, what the user has cared about lately, the understandings and changes between the two of you. It is the continuity of companionship, not working rules (those belong in standing memory). Write dates as absolute dates. text is the complete new file; baseHash comes from assistant_mind_read with part "between_us" (empty when it does not exist yet); summary says what changed.',
+        parameters: {
+            text: { type: 'string', required: true, description: 'Complete new "between us" text.' },
+            baseHash: { type: 'string', required: true, description: 'hash returned by assistant_mind_read for "between_us"; empty when it does not exist yet.' },
+            summary: { type: 'string', required: true, description: 'What changed.' },
+        },
+        execute: (args, who) => replaceWhole('between', config.betweenMaxChars, args, who),
+    }, { effect: 'write', writesSegments: BETWEEN_WRITES, allow: who => permissions(who).between })
 }
 

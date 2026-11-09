@@ -78,18 +78,20 @@ export function createExits({ report }) {
 
     /**
      * 登记一个出口。
-     * @param definition - `{ id, label, sessions() → [{ sessionId, as: 'hub' | 'group', label? }], notify? }`。
+     * @param definition - `{ id, label, sessions() → [{ sessionId, as: 'hub' | 'group', label? }], notify?, sentBetween? }`。
      *   `notify({ sessionIds, key, text, at })` 收核心挑给它的会话（它接着的、按调用方给的顺序），
      *   返回 `{ status: 'sent' | 'skipped' | 'failed', reason? }`。
+     *   `sentBetween(sessionId, from, to)` 交出这段时间里这个会话中途发到用户手上的话 `[{ at, text }]`（毫秒），现在读不到时返回 `null`。
      * @returns 撤销登记。
      */
     function register(definition) {
-        const { id, label, sessions, notify } = definition ?? {}
+        const { id, label, sessions, notify, sentBetween } = definition ?? {}
         if (typeof id !== 'string' || id === '') throw new TypeError('出口要有 id')
         if (typeof sessions !== 'function') throw new TypeError(`出口 ${id} 要有 sessions()`)
         if (notify !== undefined && typeof notify !== 'function') throw new TypeError(`出口 ${id} 的 notify 要是函数`)
+        if (sentBetween !== undefined && typeof sentBetween !== 'function') throw new TypeError(`出口 ${id} 的 sentBetween 要是函数`)
         if (exits.has(id)) throw new Error(`出口 ${id} 已经登记过`)
-        const value = Object.freeze({ id, label: String(label ?? id), sessions, ...notify === undefined ? {} : { notify } })
+        const value = Object.freeze({ id, label: String(label ?? id), sessions, ...notify === undefined ? {} : { notify }, ...sentBetween === undefined ? {} : { sentBetween } })
         exits.set(id, value)
         return () => {
             if (exits.get(id) === value) exits.delete(id)
@@ -155,5 +157,26 @@ export function createExits({ report }) {
         return { status: 'failed', exit: exit.id, reason }
     }
 
-    return Object.freeze({ register, servedBy, foreground, list, notify })
+    /**
+     * 这个会话中途发到用户手上的话：各出口的合在一起，按时间排。
+     * @returns `{ sends: [{ at, text }], unread }`；`unread` 为真时有出口现在读不到，没列出来不等于没发过。
+     */
+    async function sentBetween(sessionId, from = 0, to = Infinity) {
+        const sends = []
+        let unread = false
+        for (const exit of exits.values()) {
+            if (exit.sentBetween === undefined) continue
+            try {
+                const got = await exit.sentBetween(String(sessionId), from, to)
+                if (got === null || got === undefined) unread = true
+                else sends.push(...got)
+            } catch (error) {
+                unread = true
+                report('core/exit-sends-failed', { text: `出口 ${exit.id} 交不出中途发送（${error?.message ?? error}）`, data: { subject: exit.id } })
+            }
+        }
+        return { sends: sends.sort((left, right) => left.at - right.at), unread }
+    }
+
+    return Object.freeze({ register, servedBy, foreground, list, notify, sentBetween })
 }

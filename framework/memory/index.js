@@ -1,7 +1,9 @@
 /**
  * 记忆模块：具体记忆和便签。提供服务 `memory`、`notes`，上下文段 `memory-index`，七个工具。
  *
- * - 便签：一个文件（路径是配置），格式照旧，读和写用 `notes.js` 的同一套解析；不进上下文。谁都能写（外部调用方只读时除外）。
+ * - 便签：一个会话一本，都在同一个目录（配置）下，读和写用 `notes.js` 的同一套解析；不进上下文。中枢、后台思考、外部调用方共用
+ *   `hub` 这一本（外部调用方只读时不能写）；项目里的会话一个项目一本，别的会话一个会话一本。写只写自己那本。中枢、后台思考、
+ *   外部调用方可以读别的本子（中枢那本只记指向，细节在项目那本）；别的会话只读自己的。
  *
  * - 一条一个文件，在核心内容库的 `memories/` 下（目录是配置），格式和旧的 mind-writes 相同；编号 `mem-<ULID>`。
  *   写入、删除经 `core.content.write`（留痕、用户手改的提交由内容库做）。
@@ -28,9 +30,10 @@ import { defineDomain } from '@deepseek-ai/dsh-storage-domain'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { z } from 'zod'
 import { callerLabel } from '../core/content.js'
+import { agoText, clockText } from '../core/time.js'
 import { cosine, decodeVector, encodeVector } from '../embedder/index.js'
 import { NotesError, editNotes, excerpt, literalRanges, parseNotes, snippetAround, textWindow } from './notes.js'
-import { MEMORY_ID, NOTE_ID, describeIndexChange, formatMemory, indexText, parseMemory, ulid } from './store.js'
+import { MEMORY_ID, NOTE_ID, describeIndexChange, formatMemory, indexFit, indexText, parseMemory, ulid, ulidTime } from './store.js'
 
 export const name = 'mind-framework-memory'
 export const inject = ['core', 'storageDomain']
@@ -38,9 +41,14 @@ export const SERVICE = 'memory'
 export const INDEX_SEGMENT = 'memory-index'
 const WRITES = Object.freeze([INDEX_SEGMENT])
 
+/** 中枢那一本。 */
+export const HUB_BOOK = 'hub'
+/** 便签以前的位置。 */
+const LEGACY_NOTES_FILE = 'notes.md'
+
 export const Config = Schema.object({
     memoriesDirectory: Schema.string().default('memories').description('具体记忆的目录（相对内容库）'),
-    notesFile: Schema.string().default('notes.md').description('便签文件（相对内容库）'),
+    notesDirectory: Schema.string().default('notes').description('便签的目录（相对内容库），一个会话一本'),
     notesMaxChars: Schema.natural().default(8000).description('便签的篇幅上限（字），超了照样写、返回值里写明，并交给后台思考整理；0 不限'),
     indexChars: Schema.natural().default(4000).description('记忆目录的篇幅上限（字）'),
     keywordWeight: Schema.number().default(0.3).description('检索时关键词命中率的权重'),
@@ -78,7 +86,8 @@ export function memoryAccess(who, project) {
     if (who?.kind !== 'session') return { readAll: false, readable: () => false, writable: () => false }
     switch (who.role) {
         case 'hub': return { readAll: true, readable: () => true, writable: scope => scope === 'global' || /^workspace:\S+$/.test(scope) }
-        case 'background': return { readAll: true, readable: () => true, writable: scope => scope === 'global' }
+        case 'background':
+        case 'tidy': return { readAll: true, readable: () => true, writable: scope => scope === 'global' }
         default: return ownOnly
     }
 }
@@ -226,6 +235,7 @@ export async function apply(ctx, config) {
             sources: sources.length > 0 ? sources : [callerLabel(who)], body,
         })
         const written = await core.content.write([{ path: pathOf(id), text, baseHash: existing?.hash ?? null }], { message: `${existing === undefined ? '新增' : '修改'}记忆：${title}`, by: who })
+        ctx.get('search')?.touch?.('memory')
         const memories = await load()
         let note
         const embedder = ctx.get('embedder')
@@ -254,6 +264,7 @@ export async function apply(ctx, config) {
         if (String(baseHash ?? '') !== memory.hash) throw new MemoryError(`记忆 ${memory.id} 在你读取以后已经变了，先重新读`, formatMemory(memory))
         const why = String(reason ?? '').trim()
         const written = await core.content.write([{ path: pathOf(memory.id), text: null, baseHash: memory.hash }], { message: `删除记忆：${memory.title ?? memory.id}${why ? `（${why}）` : ''}`, by: who })
+        ctx.get('search')?.touch?.('memory')
         if (vectors().get(memory.id) !== undefined) await vectors().delete(memory.id)
         await load()
         return { id: memory.id, removed: true, commit: written.commit ?? null }
@@ -267,15 +278,20 @@ export async function apply(ctx, config) {
         const candidates = [...(await load()).values()].filter(memory => access.readable(memory.scope ?? 'global'))
         let similarity = new Map()
         let note
+        const searched = { keyword: true, semantic: 'ok' }
         const embedder = ctx.get('embedder')
-        if (embedder === undefined) note = '没有向量提供方，只按关键词检索'
-        else {
+        if (embedder === undefined) {
+            note = '没有向量提供方，只按关键词检索'
+            searched.semantic = 'none'
+        } else {
             try {
                 await refreshVectors(candidates, embedder)
                 const [asked] = await embedder.embed([String(query)])
                 similarity = new Map(candidates.map(memory => [memory.id, cosine(asked, decodeVector(vectors().get(memory.id).vector))]))
             } catch (error) {
                 note = `语义检索失败（${error?.message ?? error}），只按关键词检索`
+                searched.semantic = 'failed'
+                searched.reason = String(error?.message ?? error)
             }
         }
         const hits = candidates.map((memory) => {
@@ -291,23 +307,140 @@ export async function apply(ctx, config) {
                 ...semantic === undefined ? {} : { similarity: Math.round(semantic * 1000) / 1000 },
                 keywordMatch: Math.round(keywordMatch * 1000) / 1000,
             }))
-        return { hits, ...note === undefined ? {} : { note } }
+        if (hits.length === 0 && searched.semantic !== 'ok') note = `没搜到不代表没有：${note}`
+        return { hits, searched, ...note === undefined ? {} : { note } }
     }
 
-    ctx.provide(SERVICE, { write, read, forget, search })
+    /** 体检用：最新的一条全局记忆和能搜回它的说法；没有记忆时是 `null`。 */
+    async function sample() {
+        const newest = [...(await load()).values()].filter(memory => (memory.scope ?? 'global') === 'global')
+            .sort((left, right) => String(right.updated).localeCompare(String(left.updated)))[0]
+        return newest === undefined ? null : { id: newest.id, query: newest.title }
+    }
+
+    /** 给检索底座：每条记忆一行。 */
+    async function indexRows() {
+        return [...(await load()).values()].map((memory) => {
+            const text = embeddedText(memory)
+            return {
+                ref: memory.id,
+                scope: `memory:${memory.scope ?? 'global'}`,
+                at: Date.parse(memory.updated) || 0,
+                title: memory.title,
+                summary: memory.summary,
+                hash: sha256(text),
+                text,
+            }
+        })
+    }
+
+    /** 这个调用方看得到的范围；`null` 是全部。 */
+    async function scopesFor(who) {
+        const access = accessOf(who)
+        if (access.readAll) return null
+        const scopes = new Set([...(await load()).values()].map(memory => memory.scope ?? 'global'))
+        return [...scopes].filter(scope => access.readable(scope)).map(scope => `memory:${scope}`)
+    }
+
+    /** 向量最近的记忆编号（检索底座的向量一路）。 */
+    async function nearest(target, { who, limit = 15 } = {}) {
+        const access = accessOf(who)
+        const embedder = ctx.get('embedder')
+        const model = embedder === undefined ? null : vectorModel(embedder)
+        const scored = []
+        for (const memory of (await load()).values()) {
+            if (!access.readable(memory.scope ?? 'global')) continue
+            const stored = vectors().get(memory.id)
+            if (stored === undefined || `${stored.model}@${stored.dimensions}` !== model) continue
+            const similarity = cosine(target, decodeVector(stored.vector))
+            if (similarity >= config.minSimilarity) scored.push({ id: memory.id, similarity })
+        }
+        return scored.sort((left, right) => right.similarity - left.similarity).slice(0, limit).map(item => item.id)
+    }
+
+    ctx.provide(SERVICE, { write, read, forget, search, sample, indexRows, scopesFor, nearest })
 
     /* ------------------------------------------------------------------ 便签 */
 
-    let notesCache
-    /** 当前便签：`{ fileHash, text, notes }`；文件不存在时是空的。 */
-    async function currentNotes() {
-        const stored = await core.content.read(config.notesFile)
+    const pathOfBook = book => `${config.notesDirectory}/${book}.md`
+    const readsEveryBook = who => who?.kind !== 'session' || who.role === 'hub' || who.role === 'background' || who.role === 'tidy'
+    /** 调用方自己的那本。不是某个会话调的（外部调用方、程序）算中枢那本。 */
+    function ownBook(who) {
+        if (readsEveryBook(who)) return HUB_BOOK
+        const project = core.sessions.projectOf(who.sessionId)
+        return encodeURIComponent(project === null ? `session-${who.sessionId}` : `project-${project.id}`)
+    }
+    /** 这次要看的本子：不写就是自己的；只有中枢、后台思考、外部调用方能看别的本子。 */
+    function bookFor(book, who) {
+        const own = ownBook(who)
+        const wanted = book === undefined || book === null || book === '' ? own : String(book)
+        if (wanted !== own && !readsEveryBook(who)) throw new NotesError('INVALID_ARGUMENT', `这个会话只能看自己的便签（${own}）`)
+        if (!/^[^/\\.][^/\\]*$/.test(wanted)) throw new NotesError('INVALID_ARGUMENT', `没有便签本 "${wanted}"`)
+        return wanted
+    }
+    async function listBooks() {
+        const entries = await core.content.list(config.notesDirectory)
+        return entries.map(({ path }) => /([^/\\]+)\.md$/.exec(path)?.[1]).filter(book => book !== undefined).sort()
+    }
+
+    const notesCache = new Map()
+    /** 每本每行最后一次提交的时刻，按文件版本缓存；有还没提交的行时过一分钟再取（定时 sweep 可能已经提交了）。 */
+    const lineTimesCache = new Map()
+    async function lineTimesOf(book, fileHash) {
+        const cached = lineTimesCache.get(book)
+        if (cached?.fileHash === fileHash && (!cached.pending || Date.now() - cached.at < 60_000)) return cached
+        const path = pathOfBook(book)
+        let times = null
+        let reason
+        try {
+            times = await core.content.lineTimes?.(path) ?? null
+            if (times === null) reason = '心智仓里没有这本的提交记录'
+        } catch (error) {
+            reason = `取提交记录失败（${error?.message ?? error}）`
+        }
+        const mtime = await stat(join(core.content.root, path)).then(info => info.mtimeMs).catch(() => undefined)
+        const entry = { fileHash, times, mtime, reason, pending: times?.includes(null) ?? false, at: Date.now() }
+        lineTimesCache.set(book, entry)
+        return entry
+    }
+
+    /**
+     * 一条便签的时间：`created` 从编号（ULID）里解出来；`updated` 是它那几行里最晚的一次提交。
+     * 有还没提交的行时取文件修改时间并写明；取不到写“未知”和原因。
+     */
+    function noteTimes(note, lines) {
+        const created = ulidTime(note.id.slice('note-'.length))
+        const out = Number.isFinite(created) ? { created: clockText(created, core.timezone) } : {}
+        const unknown = reason => ({ ...out, updated: '未知', updatedNote: reason })
+        if (lines.times === null) return unknown(lines.reason ?? '取不到提交记录')
+        const own = lines.times.slice(note.headingLine - 1, note.bodyEndLine)
+        if (own.length === 0) return unknown('提交记录里没有这几行')
+        if (own.includes(null)) {
+            if (lines.mtime === undefined) return unknown('这条有还没提交进心智仓的改动，文件修改时间也取不到')
+            return { ...out, updated: clockText(lines.mtime, core.timezone), updatedAgo: agoText(lines.mtime), updatedNote: '这条有还没提交进心智仓的改动，时间取文件修改时间（可能比这条实际改的晚）' }
+        }
+        const latest = Math.max(...own)
+        return { ...out, updated: clockText(latest, core.timezone), updatedAgo: agoText(latest) }
+    }
+    /** 这一本现在的样子：`{ fileHash, text, notes }`；文件不存在时是空的。 */
+    async function currentNotes(book) {
+        const path = pathOfBook(book)
+        const stored = await core.content.read(path)
         const text = stored?.text ?? ''
         const fileHash = stored?.hash ?? null
-        if (notesCache?.fileHash !== fileHash || notesCache === undefined) {
-            notesCache = { fileHash, text, notes: parseNotes(text, { label: `${config.notesFile} ` }).notes }
+        if (notesCache.get(book)?.fileHash !== fileHash || !notesCache.has(book)) {
+            notesCache.set(book, { fileHash, text, notes: parseNotes(text, { label: `${path} ` }).notes })
         }
-        return notesCache
+        return notesCache.get(book)
+    }
+
+    // 便签以前是内容库根下的一个文件：挪成中枢那一本，留痕里看得到是一次移动。
+    const legacyNotes = await core.content.read(LEGACY_NOTES_FILE)
+    if (legacyNotes !== null && await core.content.read(pathOfBook(HUB_BOOK)) === null) {
+        await core.content.write([
+            { path: pathOfBook(HUB_BOOK), text: legacyNotes.text, baseHash: null },
+            { path: LEGACY_NOTES_FILE, text: null, baseHash: legacyNotes.hash },
+        ], { message: `便签挪到 ${pathOfBook(HUB_BOOK)}`, by: { kind: 'program', plugin: name } })
     }
 
     const clamp = (value, min, max, fallback) => {
@@ -316,17 +449,20 @@ export async function apply(ctx, config) {
         return Number.isFinite(number) ? Math.min(Math.max(number, min), max) : fallback
     }
 
-    async function notesSearch(query, { limit } = {}) {
+    async function notesSearch(query, { limit, book } = {}, who) {
         const literal = String(query ?? '').trim()
         if (literal === '') throw new NotesError('INVALID_ARGUMENT', 'query 不能为空')
-        const parsed = await currentNotes()
+        const target = bookFor(book, who)
+        const parsed = await currentNotes(target)
+        const words = [...new Set(literal.split(/\s+/))]
         const items = []
+        const lines = await lineTimesOf(target, parsed.fileHash)
         for (const note of parsed.notes) {
-            const idRanges = literalRanges(note.id, literal)
-            const bodyRanges = literalRanges(note.text, literal)
-            const matchCount = idRanges.length + bodyRanges.length
-            if (matchCount === 0) continue
-            const hit = bodyRanges[0]
+            const hits = words.map(word => ({ id: literalRanges(note.id, word), body: literalRanges(note.text, word) }))
+            const wordsMatched = hits.filter(ranges => ranges.id.length + ranges.body.length > 0).length
+            if (wordsMatched === 0) continue
+            const matchCount = hits.reduce((sum, ranges) => sum + ranges.id.length + ranges.body.length, 0)
+            const hit = hits.flatMap(ranges => ranges.body).sort((left, right) => left.index - right.index)[0]
             items.push({
                 noteId: note.id,
                 headingLine: note.headingLine,
@@ -334,25 +470,39 @@ export async function apply(ctx, config) {
                 endLine: note.bodyEndLine,
                 hitLine: hit === undefined ? note.headingLine : note.startLine + note.text.slice(0, hit.index).split('\n').length - 1,
                 matchCount,
+                wordsMatched,
                 snippet: hit === undefined ? excerpt(note.text) : snippetAround(note.text, hit.index, hit.length),
+                ...noteTimes(note, lines),
             })
         }
-        items.sort((left, right) => right.matchCount - left.matchCount || left.headingLine - right.headingLine)
-        return { path: config.notesFile, fileHash: parsed.fileHash, query: literal, items: items.slice(0, clamp(limit, 1, 20, 10)) }
+        items.sort((left, right) => right.wordsMatched - left.wordsMatched || right.matchCount - left.matchCount || left.headingLine - right.headingLine)
+        return {
+            book: target,
+            path: pathOfBook(target),
+            fileHash: parsed.fileHash,
+            query: literal,
+            items: items.slice(0, clamp(limit, 1, 20, 10)),
+            searched: { keyword: true, semantic: 'none' },
+            ...items.length === 0 ? { note: `没搜到不代表没有：便签 ${target} 只按字面搜，换个说法，或者去搜记忆和经历` } : {},
+            ...readsEveryBook(who) ? { books: await listBooks() } : {},
+        }
     }
 
-    async function notesRead(noteId, { fileHash, offset, maxCharacters } = {}) {
-        const parsed = await currentNotes()
-        if (parsed.fileHash !== fileHash) throw new NotesError('REFERENCE_ERROR', `${config.notesFile} 的当前版本 ${parsed.fileHash} 和引用的版本 ${fileHash} 不同；请重新搜索`)
+    async function notesRead(noteId, { fileHash, offset, maxCharacters, book } = {}, who) {
+        const target = bookFor(book, who)
+        const parsed = await currentNotes(target)
+        if (parsed.fileHash !== fileHash) throw new NotesError('REFERENCE_ERROR', `${pathOfBook(target)} 的当前版本 ${parsed.fileHash} 和引用的版本 ${fileHash} 不同；请重新搜索`)
         const note = parsed.notes.find(entry => entry.id === noteId)
         if (note === undefined) throw new NotesError('REFERENCE_ERROR', `当前版本里没有便签 "${noteId}"；请重新搜索`)
         return {
-            path: config.notesFile,
+            book: target,
+            path: pathOfBook(target),
             fileHash: parsed.fileHash,
             noteId: note.id,
             headingLine: note.headingLine,
             startLine: note.startLine,
             endLine: note.bodyEndLine,
+            ...noteTimes(note, await lineTimesOf(target, parsed.fileHash)),
             ...textWindow(note.text, clamp(offset, 0, Number.MAX_SAFE_INTEGER, 0), clamp(maxCharacters, 1, 32_000, 12_000)),
         }
     }
@@ -360,29 +510,32 @@ export async function apply(ctx, config) {
     async function notesEdit(action, { noteId, body, fileHash } = {}, who) {
         if (!['add', 'update', 'remove'].includes(action)) throw new NotesError('INVALID_ARGUMENT', 'action 只能是 add、update 或 remove')
         if (action !== 'remove' && String(body ?? '').trim() === '') throw new NotesError('INVALID_ARGUMENT', 'body 不能为空')
-        const parsed = await currentNotes()
+        const book = ownBook(who)
+        const path = pathOfBook(book)
+        const parsed = await currentNotes(book)
         // add 不要调用方给版本（照旧）；内容库按这里读到的哈希写，读和写之间被别人改了照样会拒。
-        if (action !== 'add' && parsed.fileHash !== fileHash) throw new NotesError('REFERENCE_ERROR', `${config.notesFile} 在你读取以后已经变了；请重新搜索`)
+        if (action !== 'add' && parsed.fileHash !== fileHash) throw new NotesError('REFERENCE_ERROR', `${path} 在你读取以后已经变了；请重新搜索`)
         const id = action === 'add' ? `note-${ulid()}` : String(noteId ?? '')
         if (action !== 'add' && !NOTE_ID.test(id)) throw new NotesError('INVALID_ARGUMENT', 'noteId 应为 note-<ULID>')
         const text = editNotes(parsed.text, { action, noteId: id, body })
         const label = { add: '新增', update: '修改', remove: '删除' }[action]
-        const written = await core.content.write([{ path: config.notesFile, text, baseHash: parsed.fileHash }], { message: `${label}便签 ${id}`, by: who })
-        const note = notesOverLimit(text)
-        return { noteId: id, fileHash: written.hashes[config.notesFile] ?? null, commit: written.commit ?? null, ...note === undefined ? {} : { note } }
+        const written = await core.content.write([{ path, text, baseHash: parsed.fileHash }], { message: `${label}便签 ${id}`, by: who })
+        ctx.get('search')?.touch?.('notes')
+        const note = notesOverLimit(text, book)
+        return { noteId: id, book, fileHash: written.hashes[path] ?? null, commit: written.commit ?? null, ...note === undefined ? {} : { note } }
     }
 
     /** 便签超出篇幅上限时的一句（写入照样做）；没超或不限时为 undefined。 */
-    function notesOverLimit(text) {
+    function notesOverLimit(text, book) {
         if (config.notesMaxChars === 0 || text.length <= config.notesMaxChars) return undefined
-        return `便签已 ${text.length} 字，超出上限 ${config.notesMaxChars} 字；已照样写入，整理时做完的删掉，长期有效的挪进记忆或项目文档`
+        return `便签 ${book} 已 ${text.length} 字，超出上限 ${config.notesMaxChars} 字；已照样写入，整理时做完的删掉，长期有效的挪进记忆或项目文档`
     }
 
     // 装了后台思考时：便签超出上限，就在它的事实段里交一行，由它去整理（写便签的会话只在返回值里看到一次）。
     ctx.inject(['reflection'], (sub) => {
         const off = sub.reflection.contribute('便签', async () => {
-            const note = notesOverLimit((await currentNotes()).text)
-            return note === undefined ? [] : [note]
+            const lines = await Promise.all((await listBooks()).map(async book => notesOverLimit((await currentNotes(book)).text, book)))
+            return lines.filter(line => line !== undefined)
         })
         sub.effect(() => off, 'mind-framework-memory: notes length')
     })
@@ -390,6 +543,40 @@ export async function apply(ctx, config) {
     ctx.provide('notes', {
         search: notesSearch,
         read: notesRead,
+        books: listBooks,
+        /** 体检用：这一本里的第一条便签；空的时候是 `null`。 */
+        /** 给检索底座：每本的每条便签一行。 */
+        indexRows: async () => {
+            const rows = []
+            for (const book of await listBooks()) {
+                const parsed = await currentNotes(book)
+                const lines = await lineTimesOf(book, parsed.fileHash)
+                for (const note of parsed.notes) {
+                    rows.push({
+                        ref: `${book}/${note.id}`,
+                        scope: `notes:${book}`,
+                        title: Array.from(note.text.trim().split(/\r?\n/)[0] ?? '').slice(0, 40).join(''),
+                        hash: sha256(note.text),
+                        text: note.text,
+                        book,
+                        noteId: note.id,
+                        fileHash: parsed.fileHash,
+                        // 给检索结果显示的时间；不进 hash：只是提交了、正文没变的不算改了这条。
+                        times: noteTimes(note, lines),
+                    })
+                }
+            }
+            return rows
+        },
+        /** 这个调用方看得到的本子；`null` 是全部。 */
+        scopesFor: who => (readsEveryBook(who) ? null : [`notes:${ownBook(who)}`]),
+        sample: async (book = HUB_BOOK) => {
+            const first = (await currentNotes(book)).notes[0]
+            if (first === undefined) return null
+            // 用正文去搜（第一行去掉 Markdown 记号，取前 30 字）：拿编号搜编号只证明工具活着。
+            const line = first.text.split(/\r?\n/).map(text => text.replace(/[*_`#>\[\]]/g, '').trim()).find(Boolean) ?? ''
+            return { id: first.id, query: Array.from(line).slice(0, 30).join('') || first.id }
+        },
         add: (body, who) => notesEdit('add', { body }, who),
         update: (noteId, body, fileHash, who) => notesEdit('update', { noteId, body, fileHash }, who),
         remove: (noteId, fileHash, who) => notesEdit('remove', { noteId, fileHash }, who),
@@ -424,6 +611,28 @@ export async function apply(ctx, config) {
         return access.writable('global') || (project !== null && access.writable(`workspace:${project.id}`))
     }
 
+    /** 存的 ISO 时刻换成给模型看的（核心的时区、带偏移），另给离现在多久；认不出的原样。 */
+    const shownTimes = (record) => {
+        const out = { ...record }
+        for (const field of ['created', 'updated']) {
+            const ms = Date.parse(record?.[field])
+            if (!Number.isFinite(ms)) continue
+            out[field] = clockText(ms, core.timezone)
+            out[`${field}Ago`] = agoText(ms)
+        }
+        return out
+    }
+
+    const noteUsage = (who, source, refs, kind) => ctx.get('experience')?.noteUsage?.(who, source, refs, kind)
+
+    /** 写完以后目录还列得全吗：中枢那份（全局记忆）列不全时，写明有几条不再列出。不静默截断。 */
+    async function indexReminder() {
+        const memories = [...(await load()).values()].filter(memory => (memory.scope ?? 'global') === 'global')
+        const { lines, total } = indexFit(memories, config.indexChars)
+        if (lines.length >= total) return undefined
+        return `记忆目录到了上限 ${config.indexChars} 字，只列得下最近更新的 ${lines.length} 条，较早的 ${total - lines.length} 条不再列出（还能搜到）；整理时合并或删掉过时的`
+    }
+
     tool({
         name: 'assistant_memory_write',
         description: 'Save a specific memory: a concrete past fact worth recalling later, with where it came from (who said it in which conversation). scope "global" is visible in every session; "project" only in sessions of the current project (default inside a project). Pass id and baseHash to revise an existing memory. Every session lists the titles and summaries of the memories in its scope.',
@@ -437,7 +646,11 @@ export async function apply(ctx, config) {
             id: { type: 'string', description: 'Existing memory id to revise.' },
             baseHash: { type: 'string', description: 'hash from assistant_memory_read, required with id.' },
         },
-        execute: (args, who) => write(args, who),
+        execute: async (args, who) => {
+            const written = await write(args, who)
+            const reminder = await indexReminder()
+            return reminder === undefined ? written : { ...written, note: [written.note, reminder].filter(Boolean).join('；') }
+        },
     }, { effect: 'write', writesSegments: WRITES, allow: canWriteSomewhere })
     tool({
         name: 'assistant_memory_search',
@@ -446,37 +659,55 @@ export async function apply(ctx, config) {
             query: { type: 'string', required: true, description: 'What to look for.' },
             limit: { type: 'integer', description: '1-30, default 10.' },
         },
-        execute: (args, who) => search(args.query, { limit: args.limit }, who),
-    }, { effect: 'read', alwaysLoad: true })
+        execute: async (args, who) => {
+            const found = await search(args.query, { limit: args.limit }, who)
+            noteUsage(who, 'memory', found.hits.map(hit => hit.id), 'shown')
+            return { ...found, hits: found.hits.map(shownTimes) }
+        },
+    }, { effect: 'read' })
     tool({
         name: 'assistant_memory_read',
         description: 'Read one specific memory in full with its sources and version hash.',
         parameters: { id: { type: 'string', required: true, description: 'Memory id.' } },
-        execute: (args, who) => read(args.id, who),
+        execute: async (args, who) => {
+            const memory = shownTimes(await read(args.id, who))
+            noteUsage(who, 'memory', [memory.id], 'opened')
+            return memory
+        },
     }, { effect: 'read' })
     tool({
         name: 'assistant_notes_search',
-        description: 'Search the shared notes file literally (case-insensitive, short Chinese terms work). Returns the current file version hash plus note ids and line numbers for assistant_notes_read and assistant_note_write.',
+        description: 'Search your notes book literally (case-insensitive, short Chinese terms work; words separated by spaces match separately, notes with more of them first). Each session has its own book: the hub and background reflection share one, a project has one. The hub, background reflection and outside callers can search another book with book, and the result lists the books. Returns the current file version hash plus note ids and line numbers for assistant_notes_read and assistant_note_write.',
         parameters: {
             query: { type: 'string', required: true, description: 'Literal text to find.' },
             limit: { type: 'integer', description: '1-20, default 10.' },
+            book: { type: 'string', description: 'Another book to search; default is your own.' },
         },
-        execute: args => notesSearch(args.query, { limit: args.limit }),
-    }, { effect: 'read', alwaysLoad: true })
+        execute: async (args, who) => {
+            const found = await notesSearch(args.query, { limit: args.limit, book: args.book }, who)
+            noteUsage(who, 'notes', found.items.map(item => `${found.book}/${item.noteId}`), 'shown')
+            return found
+        },
+    }, { effect: 'read' })
     tool({
         name: 'assistant_notes_read',
-        description: 'Read one shared note from the file version returned by assistant_notes_search. A changed file fails with REFERENCE_ERROR; search again then.',
+        description: 'Read one note from the file version returned by assistant_notes_search. A changed file fails with REFERENCE_ERROR; search again then.',
         parameters: {
             noteId: { type: 'string', required: true, description: 'note id: "note-" plus a 26-character ULID.' },
             fileHash: { type: 'string', required: true, description: 'fileHash from assistant_notes_search.' },
             offset: { type: 'integer', description: 'Unicode code point offset, default 0.' },
             maxCharacters: { type: 'integer', description: '1-32000, default 12000.' },
+            book: { type: 'string', description: 'The book from assistant_notes_search; default is your own.' },
         },
-        execute: args => notesRead(String(args.noteId ?? ''), { fileHash: args.fileHash, offset: args.offset, maxCharacters: args.maxCharacters }),
+        execute: async (args, who) => {
+            const note = await notesRead(String(args.noteId ?? ''), { fileHash: args.fileHash, offset: args.offset, maxCharacters: args.maxCharacters, book: args.book }, who)
+            noteUsage(who, 'notes', [`${note.book}/${note.noteId}`], 'opened')
+            return note
+        },
     }, { effect: 'read' })
     tool({
         name: 'assistant_note_write',
-        description: 'Add, update or remove one shared note (recent leads and to-dos). update and remove need the fileHash from assistant_notes_search. The body must not contain level-1 or level-2 headings, and code fences must be closed.',
+        description: 'Add, update or remove one note in your own book (recent leads and to-dos). A project\'s progress belongs in the project\'s book, and the hub keeps only a pointer to it. update and remove need the fileHash from assistant_notes_search. The body must not contain level-1 or level-2 headings, and code fences must be closed.',
         parameters: {
             action: { type: 'string', required: true, description: '"add", "update" or "remove".' },
             noteId: { type: 'string', description: 'note id for update/remove.' },

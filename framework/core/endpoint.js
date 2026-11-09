@@ -20,6 +20,7 @@
 
 import { randomBytes, randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
+import { probeCalls } from './probe.js'
 
 export const PROTOCOL_VERSION = '2025-06-18'
 const MAX_BODY = 4 * 1024 * 1024
@@ -30,10 +31,11 @@ const MAX_BODY = 4 * 1024 * 1024
  */
 export const SERVER_INSTRUCTIONS = [
     '这是 DSH 的助手框架（Galatea）交给你的工具，名字以 assistant_ 开头，另有 DSH 的 present、schedule_*、create_goal 等，以及装了的插件的工具。',
-    '只有最常用的几个常驻（发消息、会话间转话、写和搜便签、搜记忆、搜经历、交付文档、交接）；其余只列出名字，用之前先用工具搜索按名字或用途加载。',
+    '只有最常用的几个常驻（发消息、会话间转话、写便签、统一搜索、交付文档、交接）；其余只列出名字，用之前先用工具搜索按名字或用途加载。',
     '什么时候去搜：',
-    '- 用户问起以前的事、你拿不准自己记得的对不对：先搜经历（assistant_history_*）和记忆（assistant_memory_*），不要凭印象答，也不要先反问用户。',
-    '- 要改人格、长期认知、记忆、便签：搜 assistant_persona、assistant_cognition、assistant_memory、assistant_note。',
+    '- 用户问起以前的事、你拿不准自己记得的对不对：先用 assistant_search（经历、记忆、便签、文档一起搜），不要凭印象答，也不要先反问用户。',
+    '- 要改人格、长期认知、常驻记忆、记忆、便签：搜 assistant_persona、assistant_cognition、assistant_standing、assistant_memory、assistant_note。',
+    '- 你是外部 CLI、开对话时没有带上人格和常驻记忆：开工前用 assistant_mind_read 读 standing，里面是每段对话都该知道的事实。',
     '- 要定提醒、改定时任务：搜 schedule。要看或改持续工作、项目任务：搜 assistant_work、assistant_project、assistant_task。',
     '- 要管理消息渠道、群绑定、主动联系用户：搜 assistant_channel、assistant_contact。',
     '- 用户提到语音、朗读或别的插件的能力：按用途搜一下，装了就会出来。',
@@ -105,10 +107,11 @@ export function createEndpoint({ tools, createExecutor, agents, resolveAgent, me
      * 给一个执行方会话开端点。
      * @returns `{ url, token }`。
      */
-    async function open(sessionId, { readOnly = false } = {}) {
+    /** @param options.probe - 体检用的令牌：经它调的工具，调用方带 `probe: true`（使用统计不计数），见 `probe.js`。 */
+    async function open(sessionId, { readOnly = false, probe = false } = {}) {
         const actualPort = await start()
         const token = randomBytes(24).toString('base64url')
-        grants.set(token, { sessionId: String(sessionId), readOnly: readOnly === true })
+        grants.set(token, { sessionId: String(sessionId), readOnly: readOnly === true, probe: probe === true })
         return { url: `http://${host}:${actualPort}/mcp`, token }
     }
 
@@ -272,12 +275,12 @@ export function createEndpoint({ tools, createExecutor, agents, resolveAgent, me
                 const written = metaOf(name).writesSegments
                 if (written.length > 0) await segmentWrites.before(grant.sessionId, written)
                 const executor = createExecutor()
-                const batch = await agents.withInitiator(agent, () => executor.execute({
+                const batch = await probeCalls.run(grant.probe === true, () => agents.withInitiator(agent, () => executor.execute({
                     agent,
                     signal: controller.signal,
                     toolSet,
                     calls: [{ type: 'tool-call', id: `endpoint-${randomUUID()}`, name, arguments: JSON.stringify(params.arguments ?? {}) }],
-                }))
+                })))
                 const outcome = batch.results[0]?.result
                 if (written.length > 0) await segmentWrites.after(grant.sessionId, written, outcome?.isError !== true)
                 const content = [...toMcpContent(outcome?.content ?? [])]

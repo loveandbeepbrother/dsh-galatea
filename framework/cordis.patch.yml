@@ -15,6 +15,8 @@
       name: '@loveandbeepbrother/dsh-galatea/memory'
     - id: mind-framework-experience
       name: '@loveandbeepbrother/dsh-galatea/experience'
+    - id: mind-framework-search
+      name: '@loveandbeepbrother/dsh-galatea/search'
     - id: mind-framework-reflection
       name: '@loveandbeepbrother/dsh-galatea/reflection'
     - id: mind-framework-work

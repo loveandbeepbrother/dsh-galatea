@@ -4,10 +4,10 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { runSessionSend } from '../index.js'
+import { linkOf, runSessionSend } from '../index.js'
 
 const MAIN = 'session-main'
-const PROJECT = 'session-haocai'
+const PROJECT = 'session-yuanhang'
 const TASK = 'session-task-abc'
 
 /** 框架核心的替身：按键去重，记下放进各会话的话（真核心的 deliver 在 mind-framework 的测试里）。 */
@@ -79,7 +79,7 @@ test('中枢发给接群的会话：默认回复留在对方会话、正文写�
     assert.match(await send(MAIN, { text: 'x', to: '远航', reply: 'qq' }), /reply 只能是 "group"/)
 })
 
-test('中枢按项目名、会话标题、会话 id 或 群找目标；不填、找不到、发给自己都不发', async () => {
+test('中枢按项目名、会话标题、会话 id 或群找目标；不填、找不到、发给自己都不发', async () => {
     const { core, send } = setup()
     for (const to of ['远航', '远航·项目会话', PROJECT, '777', '项目-远航']) assert.match(await send(MAIN, { text: `去看 ${to}`, to }), /已交给「远航·项目会话」/)
     assert.equal(core.inboxOf(PROJECT).length, 5)
@@ -115,4 +115,21 @@ test('目标不猜：解绑过或会话已不在的群不算；同名的群、�
         workspaces: [{ id: 'ws1', title: '远航', sessionIds: [PROJECT] }, { id: 'ws2', title: '远航', sessionIds: [OTHER] }],
     })
     assert.match(await projects.send(MAIN, { text: 'x', to: '远航' }), /有几个会话都叫「远航」/)
+})
+
+test('关联编号：交出去的话带着编号，结果末尾写出同一个；同一次调用重试时编号不变', async () => {
+    const { core } = setup()
+    const exec = { agent: { session: { id: PROJECT, header: {} } }, callId: 'call-fixed' }
+    const services = { sessionController: { list: async () => ({ items: [{ sessionId: MAIN, projections: { values: { title: '中枢' } } }, { sessionId: PROJECT, projections: { values: { title: '远航·项目会话' } } }] }) }, workspaceRegistry: { archivedSessionIds: [], list: () => [] } }
+    const ctx = { get: name => services[name] }
+    const runtime = { exitSessions: () => [], listGroups: async () => ({ status: 'ok', groups: [] }) }
+    const first = await runSessionSend(ctx, runtime, core, { text: '要你定的事' }, exec)
+    const [message] = core.inboxOf(MAIN)
+    assert.match(message.link, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+    assert.ok(first.endsWith(`（编号 ${message.link}）`))
+    const again = await runSessionSend(ctx, runtime, core, { text: '要你定的事' }, exec)
+    assert.match(again, /之前已经交给中枢了/)
+    assert.ok(again.endsWith(`（编号 ${message.link}）`), '重试时编号不变')
+    assert.equal(linkOf('session-a-call-1'), linkOf('session-a-call-1'))
+    assert.notEqual(linkOf('session-a-call-1'), linkOf('session-a-call-2'))
 })

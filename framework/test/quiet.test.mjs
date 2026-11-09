@@ -78,3 +78,24 @@ test('核心交出休息时段（按配置）和出口登记（跟着登记它�
     await fiber.dispose()
     assert.deepEqual(h.ctx.core.exits.foreground(), [], '插件卸下，登记跟着撤')
 })
+
+test('出口交出中途发送：各出口合在一起按时间排；读不到的或出错的算没读到，出错的报一条；没这个能力的出口不算', async () => {
+    const reports = []
+    const exits = createExits({ report: (kind, item) => reports.push([kind, item.text]) })
+    exits.register({ id: 'plain', sessions: () => [] })
+    assert.deepEqual(await exits.sentBetween('main'), { sends: [], unread: false })
+    assert.throws(() => exits.register({ id: 'bad', sessions: () => [], sentBetween: 'x' }), /sentBetween 要是函数/)
+    const asked = []
+    exits.register({ id: 'a', sessions: () => [], sentBetween: (...args) => { asked.push(args); return [{ at: 20, text: '后' }] } })
+    exits.register({ id: 'b', sessions: () => [], sentBetween: async () => [{ at: 10, text: '先' }] })
+    assert.deepEqual(await exits.sentBetween('main', 5, 30), { sends: [{ at: 10, text: '先' }, { at: 20, text: '后' }], unread: false })
+    assert.deepEqual(asked, [['main', 5, 30]])
+    const offline = createExits({ report: () => {} })
+    offline.register({ id: 'c', sessions: () => [], sentBetween: () => null })
+    assert.deepEqual(await offline.sentBetween('main'), { sends: [], unread: true }, '渠道还没起来')
+    exits.register({ id: 'broken', sessions: () => [], sentBetween: () => { throw new Error('坏了') } })
+    const broken = await exits.sentBetween('main')
+    assert.equal(broken.unread, true)
+    assert.equal(broken.sends.length, 2, '别的出口照收')
+    assert.deepEqual(reports.at(-1), ['core/exit-sends-failed', '出口 broken 交不出中途发送（坏了）'])
+})

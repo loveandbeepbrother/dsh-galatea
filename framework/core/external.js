@@ -7,8 +7,8 @@
  * - 每个名字一个角色为 `external` 的会话（经上游 `sessionController.create` 建，工作目录设在用户的内容目录），
  *   不跑轮，只作为它调工具时的执行上下文；令牌绑定在那个会话上。`core.caller` 认出这个会话时按登记补上 `name`、`readOnly`。
  * - `readOnly` 在服务端执行（只读端点只交读的工具）；`tools` 给了就只交这几个。
- * - 登记、作废只走主人才能调的设置页路由（上游 Connection 的精确路由：Host/Origin/Cookie 与主人身份由 Connection 核对，
- *   别人进不来）；服务上只开放 `list`。
+ * - 登记、改权限、作废只走主人才能调的设置页路由（上游 Connection 的精确路由：Host/Origin/Cookie 与主人身份由 Connection 核对，
+ *   别人进不来）；服务上只开放 `list`。登记发新令牌、旧的作废；只改权限用 `update`，令牌不变。
  *
  * @module @loveandbeepbrother/dsh-galatea/core/external
  */
@@ -120,6 +120,23 @@ export function createExternal(domain, { credentials, createSession, assignExter
         return { token, sessionId }
     }
 
+    /**
+     * 改已登记的权限（`readOnly`、`tools`，没写的不动），令牌不变：在用这个令牌的客户端不用重配，也不断线。只经主人的路由调。
+     * @returns `{ sessionId, readOnly, tools }`。
+     */
+    async function update({ name, readOnly, tools } = {}) {
+        const previous = typeof name === 'string' ? callers().get(name) : undefined
+        if (previous === undefined) throw new TypeError(`没有登记过 ${name}`)
+        if (readOnly !== undefined && typeof readOnly !== 'boolean') throw new TypeError('readOnly 要是 true 或 false')
+        if (tools !== undefined && tools !== null && (!Array.isArray(tools) || tools.some(tool => typeof tool !== 'string'))) throw new TypeError('tools 要是工具名的数组')
+        const registration = { ...previous, ...readOnly === undefined ? {} : { readOnly }, ...tools === undefined ? {} : { tools } }
+        await callers().put(name, registration)
+        const token = tokens.get(name)
+        if (token !== undefined) bind(registration, token)
+        endpoint.listChanged()
+        return { sessionId: registration.sessionId, readOnly: registration.readOnly, tools: registration.tools }
+    }
+
     function list() {
         return [...callers().entries()].map(([, { name, readOnly, tools, sessionId, lastSeen }]) => ({ name, readOnly, tools, sessionId, lastSeen }))
     }
@@ -137,11 +154,11 @@ export function createExternal(domain, { credentials, createSession, assignExter
         return true
     }
 
-    return Object.freeze({ restore, register, list, revoke, bySession })
+    return Object.freeze({ restore, register, update, list, revoke, bySession })
 }
 
 /**
- * 在上游 Connection 上挂主人才能调的路由：`GET …/list`、`POST …/register`、`POST …/revoke`。
+ * 在上游 Connection 上挂主人才能调的路由：`GET …/list`、`POST …/register`、`POST …/update`、`POST …/revoke`。
  * @returns 撤掉这些路由。
  */
 export function registerExternalRoutes(connection, external) {
@@ -160,6 +177,16 @@ export function registerExternalRoutes(connection, external) {
                 const body = await readJson(request)
                 try {
                     return json(200, await external.register({ name: body?.name, readOnly: body?.readOnly, tools: body?.tools ?? null }))
+                } catch (error) {
+                    return json(400, { error: error?.message ?? String(error) })
+                }
+            },
+        },
+        {
+            path: `${ROUTE_PREFIX}/update`, method: 'POST', fetch: async (request) => {
+                const body = await readJson(request)
+                try {
+                    return json(200, await external.update({ name: body?.name, readOnly: body?.readOnly, tools: body?.tools }))
                 } catch (error) {
                     return json(400, { error: error?.message ?? String(error) })
                 }

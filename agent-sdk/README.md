@@ -52,6 +52,7 @@ Galatea 的 Agent SDK 执行方：经官方的 Claude Agent SDK 把本机的 Cla
 | `autoCompactWindow` | 680000 | Claude Code 自带压缩的兜底阈值（token） |
 | `disallowedTools` | 无 | 另外不给模型用的工具，例如 `[Workflow, ScheduleWakeup, ReportFindings]`，也可以写另加服务器里的工具；`AskUserQuestion` 总是不给（DSH 里没人回答它） |
 | `pluginSkills` | 不填 | 不填时不过滤 skill，和 Claude Code 一样；填了只放行账号目录 `skills/` 下的用户级 skill，加上这里按名字列出的插件 skill（例如 `[anthropic-skills:pdf]`） |
+| `strictMcpConfig` | 关 | 只用 `mcpServers` 写明的服务器，不继承 Claude Code 自己的配置（用户级、项目级、local）。工作目录在某个仓库的工作树里时，那个仓库给外部 CLI 配的服务器不会跟进来 |
 | `mcpServers` | 无 | 另外给 Claude Code 挂的 MCP 服务器：名字 → 配置，写法同 Agent SDK 的 `mcpServers`。名字 `dsh` 留给框架的产品工具，重名时执行方启动就报错 |
 | `allowedTools` | 无 | 另加服务器里不用确认就能用的工具，例如 `mcp__chrome__take_snapshot`；其余照权限模式处理 |
 | `systemAppend` | 空 | 追加在系统提示末尾的说明，例如另加的工具该怎么用 |

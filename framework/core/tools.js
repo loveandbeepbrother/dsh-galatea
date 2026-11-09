@@ -20,6 +20,8 @@
  * @module @loveandbeepbrother/dsh-galatea/core/tools
  */
 
+import { inProbe } from './probe.js'
+
 export const TOOL_AUDIENCES = Object.freeze(['all', 'native-only'])
 
 /**
@@ -102,13 +104,15 @@ export function createTools({ roleOf, headerOf, externalOf, report }) {
             id = String(header.parentSession)
         }
         const role = roleOf(id)
+        // 体检令牌发起的调用带上标记（见 probe.js）。
+        const probe = inProbe() ? { probe: true } : {}
         if (role === 'external') {
             const registration = externalOf(id)
-            if (registration !== undefined) return { kind: 'external', name: registration.name, readOnly: registration.readOnly }
+            if (registration !== undefined) return { kind: 'external', name: registration.name, readOnly: registration.readOnly, ...probe }
             reportOnce(`core/unregistered-external:${id}`, { sessionId: id, text: `会话 ${id} 的角色是外部调用方，却找不到它的登记，按只读处理` })
-            return { kind: 'external', name: id, readOnly: true }
+            return { kind: 'external', name: id, readOnly: true, ...probe }
         }
-        return { kind: 'session', sessionId: id, role }
+        return { kind: 'session', sessionId: id, role, ...probe }
     }
 
     /** `allow` 不许抛错：抛了当"不允许"，报一次。 */

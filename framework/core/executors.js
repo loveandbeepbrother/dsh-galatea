@@ -14,7 +14,7 @@
  *     额度闸门是 `quotaGate: { state(sessionId), codes, detail? }`，其余写 `true`；没有的能力就不写。
  *     `detail(sessionId)` 只交补充的字段 `{ since, resetsAt, window, outageId, windows }`（`windows`：`{ <窗口>: { utilization, resetsAt } }`，
  *     `utilization` 是 0–1 的占比）；状态只从 `state` 一处来，两边不会说法不一致。
- *     会话的活动是 `activity(sessionId)` → `{ background, lastOutputAt }`（会话里还在跑的后台任务数、进程最后一次输出的时间），
+ *     会话的活动是 `activity(sessionId)` → `{ background, lastOutputAt, busy? }`（`busy`：进程正在跑一轮，包括执行方自己开的）（会话里还在跑的后台任务数、进程最后一次输出的时间），
  *     Watchdog 看"项目任务多久没活动"时用；没有这项能力的执行方，只能看日志的时间。
  * - 原生由核心自己登记；它的换新对话、用量、主动压缩、兜底压缩线由上下文模块的压缩引擎提供（`provideNative`），
  *   没装那个引擎时，换新对话写明做不了、用量为 `null`、没有主动压缩；启动完成时还是这样就报一次 `core/native-engine-missing`
@@ -253,7 +253,7 @@ export function createExecutors({ selectionOf, report, domain, now = Date.now })
         if (value === null || value === undefined) return null
         const background = Number.isInteger(value.background) && value.background > 0 ? value.background : 0
         const lastOutputAt = Number.isFinite(value.lastOutputAt) ? value.lastOutputAt : null
-        return { background, lastOutputAt }
+        return { background, lastOutputAt, ...value.busy === true ? { busy: true } : {} }
     }
 
     /**

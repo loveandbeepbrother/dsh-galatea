@@ -846,6 +846,8 @@ export async function createQQPlatform(options = {}) {
 export const QQ_DELIVERY = Object.freeze({
     sends: Object.freeze(['text', 'image', 'file', 'voice']),
     holdsUntilNextMessage: true,
+    replyLimit: 4,
+    replyLimitLabel: 'QQ',
     canDeliverNow: ({ live, repliesLeft, repliesNeeded = 1 }) => live === true && repliesLeft >= Math.max(repliesNeeded, 1),
 });
 

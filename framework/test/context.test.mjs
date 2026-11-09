@@ -117,3 +117,19 @@ test('交接标记：执行方真换过新对话以后经 onSwitched 回来，�
     const entries = (await h.ctx.experience.read({ sessionId: 'main', at: '2000-01-01' }, { kind: 'external', name: 't', readOnly: true })).entries
     assert.deepEqual(entries.map(item => [item.ref, item.kind, item.text]), [[`marker:main:handoff:${state.switchAt}`, '交接', `交接到新对话，交接文档：${doc}`]])
 })
+
+test('recentTurns 把出口交来的中途发送并进原文；出口读不到时写明一句', async (t) => {
+    const { h, turn } = await setup(t)
+    await turn('第一句')
+    let answer = null
+    const fiber = await h.ctx.plugin({
+        name: 'probe-sends',
+        inject: ['core'],
+        apply: ctx => { ctx.core.exits.register({ id: 'probe', sessions: () => [], sentBetween: () => answer }) },
+    })
+    t.after(() => fiber.dispose())
+    assert.match(await h.ctx.context.recentTurns('main'), /没读到/)
+    answer = [{ at: Date.now() + 1, text: '发到手机的话' }]
+    const text = await h.ctx.context.recentTurns('main')
+    assert.ok(text.includes('用户：第一句') && text.endsWith('你（中途发的）：发到手机的话') && !text.includes('没读到'))
+})

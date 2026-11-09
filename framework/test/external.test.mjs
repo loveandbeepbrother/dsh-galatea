@@ -93,6 +93,35 @@ test('重启以后令牌不变：按登记从凭据里取回令牌接回端点�
     assert.equal((await rpc(url, again.token, 'tools/list')).status, 200)
 })
 
+test('改已登记的工具清单：令牌不变、旧令牌照样能用；端点按新清单筛；重启以后还是新清单；没写的不动', async (t) => {
+    const root = await mkdtemp(join(tmpdir(), 'mind-framework-external-'))
+    t.after(() => rm(root, { recursive: true, force: true, maxRetries: 3 }))
+    const first = await withExtras(t, root)
+    const { token, sessionId } = (await first.call('POST', 'register', { name: 'claude-dev', readOnly: false, tools: ['probe_read'] })).body
+    const probes = async (h, used) => {
+        const url = await h.ctx.core.toolEndpoint.open(sessionId).then(opened => opened.url)
+        const answer = (await rpc(url, used, 'tools/list')).body
+        assert.equal(answer.error, undefined, JSON.stringify(answer.error))
+        return answer.result.tools.map(tool => tool.name).filter(name => name.startsWith('probe_')).sort()
+    }
+    assert.deepEqual(await probes(first.h, token), ['probe_read'])
+
+    const updated = await first.call('POST', 'update', { name: 'claude-dev', tools: ['probe_read', 'probe_other'] })
+    assert.deepEqual(updated, { status: 200, body: { sessionId, readOnly: false, tools: ['probe_read', 'probe_other'] } }, 'readOnly 没写就不动；回应里没有令牌')
+    assert.deepEqual(await probes(first.h, token), ['probe_other', 'probe_read'], '同一个令牌，新清单当场生效')
+    await first.shutdown()
+
+    const { h, call, shutdown } = await withExtras(t, root)
+    t.after(shutdown)
+    const url = await h.ctx.core.toolEndpoint.open(sessionId).then(opened => opened.url)
+    assert.equal((await rpc(url, token, 'tools/list')).status, 200, '重启以后同一个令牌照样能用')
+    assert.deepEqual(h.ctx.core.external.list().find(entry => entry.name === 'claude-dev').tools, ['probe_read', 'probe_other'], '重启以后还是新清单')
+    assert.equal((await call('POST', 'update', { name: 'nobody', tools: [] })).status, 400)
+    assert.equal((await call('POST', 'update', { name: 'claude-dev', tools: 'probe_read' })).status, 400)
+    assert.deepEqual(h.ctx.core.external.list().find(entry => entry.name === 'claude-dev').tools, ['probe_read', 'probe_other'], '写错的没存')
+    assert.equal(h.ctx.core.external.update, undefined, '服务上不开放')
+})
+
 test('外部调用方的会话不跑轮：deliver 交给它一律不可用，并报一条', async (t) => {
     const { h, call } = await withExtras(t)
     const { sessionId } = (await call('POST', 'register', { name: 'claude-dev', readOnly: true })).body

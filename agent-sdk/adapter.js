@@ -48,15 +48,15 @@ export const SYSTEM_APPEND = [
     '你同时是用户在 DSH 中的个人助手。用用户的语言写这一轮的文字，工具调用之间的也一样（代码标识符、路径与引用的原文除外）。',
     '最后一次工具调用之后的那段文字是这一轮的回复；会话接着聊天渠道时，它会发到用户那边，保持自然简洁，少用需要渲染的复杂格式，',
     '也不必在末尾重述前面说过的话。工具调用之间写的文字只留在 DSH 桌面上，不会发到聊天渠道：那里同样不写“我先看看”“Now read …”之类的过程旁白，',
-    '也不放用户必须看到的内容。DSH 交给你的人格、长期认知与其他上下文，按它们行事：',
-    '以“（DSH 会话开头上下文”开头的是你的人格、长期认知、记忆目录、待告知留言和各插件的约定等，在系统提示里，新对话开始时是最新版本；',
+    '也不放用户必须看到的内容。DSH 交给你的人格、长期认知、常驻记忆与其他上下文，按它们行事：',
+    '以“（DSH 会话开头上下文”开头的是你的人格、长期认知、常驻记忆、记忆目录、待告知留言和各插件的约定等，在系统提示里，新对话开始时是最新版本；',
     '以“（DSH 提示”开头的是系统附带的提醒，以“（交接”开头的是你在上一段对话结束前写的交接文档。它们都不是用户的话。',
     '上下文大了时由你决定何时换新对话：先把该长期保存的写进记忆、便签与项目文档，再写交接文档（只写工作状态：进行中的事和进度、',
     '还没落档的决定、等用户回复的问题、最近动过的文件、最后几轮在谈什么，并写明接续经历库的哪一段），然后调用 `assistant_context_handoff`。',
     '放到后台的子代理或命令有了结果时，你会自己接着处理一轮；这一轮最后的那段文字同样是回复，像平常一样说就好。',
-    'DSH 的经历检索、记忆与便签等以 `mcp__dsh__` 开头的工具提供，需要回忆、查便签时使用它们。',
+    'DSH 的经历、记忆、便签和文档检索等以 `mcp__dsh__` 开头的工具提供，需要回忆时先用 `assistant_search`，它一次搜全部。',
     '你的记忆由这些工具维护：用户告诉你值得长期记住的事、作品中定下的设定和约定，用 `assistant_memory_write` 记下并注明来源；',
-    '近期待办与线索写进便签；从经历中形成的概括理解整理进长期认知；人格的稳定变化先成候选，等用户本人回复确认编号。',
+    '近期待办与线索写进便签；从经历中形成的概括理解整理进长期认知；长期成立、每段对话都该知道的事实写进常驻记忆，变了就改；人格的稳定变化先成候选，等用户本人回复确认编号。',
     '定时提醒用 `schedule_` 开头的工具建立；到点时会以“[SCHEDULE REMINDER]”交给你。',
     '提到本机文件时写成链接 `[文件名](<绝对路径>)`，DSH 桌面里可以点开。',
     '交给用户看的完整文档（大纲、分析、报告、表格等）用 `mcp__dsh__present` 交付，在 DSH 会话里显示为可预览、可打开的文件卡片；',
@@ -152,19 +152,19 @@ export const HOOK_CONTEXT_CHARS = 9_000
 /** 会话开头上下文最多分几个钩子。 */
 export const OPENING_SLOTS = 4
 
-export const OPENING_LEAD = '（DSH 会话开头上下文，不是用户发言：人格、长期认知、记忆目录、渠道约定与待告知留言等。'
+export const OPENING_LEAD = '（DSH 会话开头上下文，不是用户发言：人格、长期认知、常驻记忆、记忆目录、渠道约定与待告知留言等。'
     + '新对话开始时给出，中途由别处改动时另行提醒，自己改的不提醒。）'
 
 /** 每条变更说明前的一句（说明由框架核心按各段的 onChange 给出）。 */
 export const NOTE_LEAD = '（DSH 提示，不是用户发言）'
 
 /** 兜底压缩后补发改过的几节时的开头。 */
-export const OPENING_UPDATE_LEAD = '（DSH 会话开头上下文更新，不是用户发言：系统提示里的人格、长期认知、记忆目录、渠道约定等在这段对话开始后改过，'
+export const OPENING_UPDATE_LEAD = '（DSH 会话开头上下文更新，不是用户发言：系统提示里的人格、长期认知、常驻记忆、记忆目录、渠道约定等在这段对话开始后改过，'
     + '以下几节取代系统提示里的同名旧版本，其余照旧。）'
 
 /** 交接文档随新对话第一条消息发送时的开头。 */
 export const HANDOFF_LEAD = '（交接，不是用户发言：上一段对话结束前你自己写的交接文档，从这里接着做。'
-    + '人格、长期认知、记忆目录、渠道约定等在系统提示里；原话与细节在经历库里。）'
+    + '人格、长期认知、常驻记忆、记忆目录、渠道约定等在系统提示里；原话与细节在经历库里。）'
 
 /**
  * 切到别的执行方之前那一轮看不见的交接（可选能力 `handoffTurn`）：这段对话里的东西切过去以后对方看不到，
@@ -172,7 +172,7 @@ export const HANDOFF_LEAD = '（交接，不是用户发言：上一段对话结
  */
 export function handoffTurnPrompt(path) {
     return '（DSH 系统请求，不是用户发言，用户看不到这一轮）这个会话要切到别的模型接着做。切过去以后，它看不到你这段对话，'
-        + '只看得到系统提示里的人格、长期认知、记忆目录、渠道约定，和你现在写的交接文档。请写这份交接文档，只写开头上下文里没有的工作状态：'
+        + '只看得到系统提示里的人格、长期认知、常驻记忆、记忆目录、渠道约定，和你现在写的交接文档。请写这份交接文档，只写开头上下文里没有的工作状态：'
         + '进行中的事和它到了哪一步、还没存到别处的决定、在等用户回答的问题、最近改过的文件、最后几轮在谈什么、接着经历库里的哪一段。'
         + `你的整条回复就是交接文档的正文，会原样存到 ${path}，所以不要调用工具，也不要写正文以外的话。`
 }
@@ -864,6 +864,7 @@ export class AgentSdkAdapter extends LlmAdapter {
                 ...Array.isArray(skills) ? { skills } : {},
                 // 产品工具的权限由 DSH 执行器检查，在 Claude Code 一侧预先放行；另加的服务器只放行配置里 allowedTools 列出的。
                 ...Object.keys(servers).length === 0 ? {} : { mcpServers: servers },
+                ...this.config.strictMcpConfig === true ? { strictMcpConfig: true } : {},
                 ...allowed.length === 0 ? {} : { allowedTools: allowed },
                 // 系统提示在一段对话第一次请求时记下，沿用到压缩或开新对话；压缩后按这个进程启动时的追加段重新生成。
                 systemPrompt: { type: 'preset', preset: 'claude_code', append: launch.length === 0 ? append : `${append}\n\n${openingText(launch)}` },
@@ -1131,8 +1132,9 @@ export class AgentSdkAdapter extends LlmAdapter {
     /**
      * 交接换新对话（框架的 newConversation）。
      * @param options.onSwitched - 真换过去以后调一次 `{ at }`（上下文模块据此往经历库推交接标记）。
+     * @param options.ready - 换之前要等它（交接之前的整理）：等的时候占着串行链，下一条消息排在后面，新对话一定拿到整理之后的版本。
      */
-    async handoff(sessionId, document, { onSwitched } = {}) {
+    async handoff(sessionId, document, { onSwitched, ready } = {}) {
         if (typeof document !== 'string' || document.trim() === '') return { scheduled: false, reason: '没有给出交接文档的路径' }
         let text
         try {
@@ -1151,6 +1153,7 @@ export class AgentSdkAdapter extends LlmAdapter {
             // 调用它的可能是 Claude Code 自己开的一轮（不占串行链）：等那一轮结束、回复取回以后再关。
             const live = this.live.get(sessionId)
             if (live !== undefined) await this.quiet(live)
+            await Promise.resolve(ready).catch(() => {})
             if (this.live.get(sessionId) === live) this.dispose(sessionId)
             await this.writeBinding(sessionId, { claudeSessionId: null, conversation: null })
             try {

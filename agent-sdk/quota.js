@@ -505,7 +505,9 @@ export class QuotaGate {
         const sessions = {}
         for (const [sessionId, ledger] of Object.entries(record.backlog)) {
             // 后台会话的积压不唤醒，后台思考到点自己再来；被额度打断的后台一轮照样唤醒告诉它。
-            const background = this.deps.roleOf?.(sessionId) === 'background' && ledger.interrupted.length === 0
+            // 交接整理是一次性的，超时已经报过，额度恢复后不用接着做。
+            const role = this.deps.roleOf?.(sessionId)
+            const background = (role === 'background' && ledger.interrupted.length === 0) || role === 'tidy'
             sessions[sessionId] = { ...ledger, wake: background ? 'deferred' : 'pending', wokeAt: null, answeredAt: null, attempts: 0 }
         }
         record.last = {

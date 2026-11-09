@@ -121,6 +121,13 @@ test('删记忆连向量一起删；用户原地改文件，目录和检索都�
     const kept = await call('main', 'assistant_memory_write', { title: '狗', summary: '邻居的狗', body: '旺财。' })
     const read = await call('main', 'assistant_memory_read', { id: written.id })
     assert.equal(read.hash, written.hash)
+    const CLOCK = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}[+-]\d{2}:\d{2}$/
+    assert.match(read.created, CLOCK, '时间按核心的时区写、带偏移')
+    assert.match(read.updated, CLOCK)
+    assert.equal(read.updatedAgo, '刚才')
+    const hit = (await call('main', 'assistant_memory_search', { query: '样本猫' })).hits.find(item => item.id === written.id)
+    assert.equal(hit.updated, read.updated)
+    assert.equal(hit.updatedAgo, '刚才')
     const path = join(content, 'memories', `${written.id}.md`)
     await writeFile(path, (await readFile(path, 'utf8')).replace('summary: 样本猫', 'summary: 用户手改过的摘要'))
     const index = (await h.ctx.core.segments.open('cc', 'main')).find(entry => entry.name === MemoryModule.INDEX_SEGMENT).text
@@ -155,4 +162,49 @@ test('记忆目录的变更说明按编号比：新增或修改、删掉了、�
     assert.match(note, new RegExp(`已删掉：mem-${A}`))
     const squeezed = describeIndexChange(before, after, () => true)
     assert.match(squeezed, new RegExp(`目录满了没再列出（记忆还在，可以检索）：mem-${A}`))
+})
+
+test('便签分本：项目会话写自己项目那本，别的项目看不到；中枢和后台思考共用一本，读得到项目那本；写只写自己那本', async (t) => {
+    const { content, book, call } = await setup(t)
+    const projectBook = `project-${book.id}`
+    const written = await call('writer', 'assistant_note_write', { action: 'add', body: '小说的进度' })
+    assert.equal(written.book, projectBook)
+    assert.match(await readFile(join(content, 'notes', `${projectBook}.md`), 'utf8'), /小说的进度/)
+
+    const own = await call('writer', 'assistant_notes_search', { query: '小说的进度' })
+    assert.equal(own.items.length, 1)
+    assert.equal(own.books, undefined, '项目会话不列别的本子')
+    assert.equal((await call('gardener', 'assistant_notes_search', { query: '小说的进度' })).items.length, 0, '别的项目搜不到')
+    assert.match((await call('gardener', 'assistant_notes_search', { query: '小说的进度', book: projectBook })).error, /只能看自己的便签/)
+    assert.match((await call('writer', 'assistant_notes_search', { query: '指向', book: 'hub' })).error, /只能看自己的便签/)
+
+    await call('main', 'assistant_note_write', { action: 'add', body: '指向：小说的进度在项目那本' })
+    assert.equal((await call('idle', 'assistant_notes_search', { query: '指向' })).items.length, 1, '后台思考和中枢同一本')
+    assert.equal((await call('main', 'assistant_notes_search', { query: '小说的进度' })).items[0].snippet.includes('指向'), true, '中枢默认只搜自己那本')
+    const other = await call('main', 'assistant_notes_search', { query: '小说的进度', book: projectBook })
+    assert.deepEqual(other.books, ['hub', projectBook].sort())
+    const read = await call('main', 'assistant_notes_read', { noteId: other.items[0].noteId, fileHash: other.fileHash, book: projectBook })
+    assert.match(read.text, /^小说的进度/)
+    assert.match((await call('main', 'assistant_notes_search', { query: 'x', book: '../personality' })).error, /没有便签本/, '不能跳出目录')
+    assert.match((await call('main', 'assistant_note_write', { action: 'update', noteId: other.items[0].noteId, body: '改', fileHash: other.fileHash })).error, /已经变了|没有/, '写只写自己那本')
+    assert.match(await readFile(join(content, 'notes', `${projectBook}.md`), 'utf8'), /小说的进度/)
+})
+
+test('检索写明搜了什么：记忆和便签都带 searched，空结果写明没搜到不代表没有；便签按空白分词', async (t) => {
+    const { h, call } = await setup(t)
+    await call('main', 'assistant_memory_write', { title: '猫的样本', summary: '样本里有一只猫', body: '猫叫甲。' })
+    const ok = await call('main', 'assistant_memory_search', { query: '猫的样本' })
+    assert.deepEqual(ok.searched, { keyword: true, semantic: 'ok' })
+    assert.equal(ok.note, undefined)
+    assert.equal((await h.ctx.memory.sample()).query, '猫的样本')
+
+    const nothing = await call('main', 'assistant_notes_search', { query: '这个词不存在' })
+    assert.deepEqual(nothing.searched, { keyword: true, semantic: 'none' })
+    assert.match(nothing.note, /^没搜到不代表没有/)
+    await call('main', 'assistant_note_write', { action: 'add', body: '框架的进度' })
+    await call('main', 'assistant_note_write', { action: 'add', body: '框架和规划都提到' })
+    const words = await call('main', 'assistant_notes_search', { query: '框架 规划' })
+    assert.equal(words.items.length, 2, '按空白分词，只命中一个词也算')
+    assert.equal(words.items[0].wordsMatched, 2, '命中词多的在前')
+    assert.equal((await h.ctx.notes.sample()).id, words.items.find(item => item.wordsMatched === 1).noteId)
 })

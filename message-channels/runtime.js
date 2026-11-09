@@ -39,6 +39,8 @@ export const CHANNEL_REPORTS = Object.freeze({
     // 一个绑定连着几片被平台确定没发出、暂停一阵，以及恢复。
     accountPaused: 'channels/account-paused',
     accountResumed: 'channels/account-resumed',
+    // 平台拒收，这条消息回不了了（平台声明 `rejectEndsReplies`）：带平台的原话和已经送达几片。
+    repliesEnded: 'channels/replies-ended',
     // 平台转来的报警（`onAlert`）格式不对，没有转报。
     alertInvalid: 'channels/alert-invalid',
 })
@@ -95,7 +97,7 @@ export function pushEntryOf(rows, label) {
     const parts = [...rows].sort((left, right) => (left.partIndex ?? 0) - (right.partIndex ?? 0))
     const [row] = parts
     if (row === undefined) return null
-    const body = parts.map(part => (part.kind === 'voice' ? '[语音]' : part.kind === 'image' ? '[图片]' : String(part.text ?? ''))).join('\n').trim()
+    const body = pushBodyOf(parts)
     if (body === '') return null
     const sent = parts.some(part => part.state === 'sent')
     const by = row.by?.kind === 'external' ? `（外部调用方 ${row.by.name ?? '未注明'} 经端点发的）\n` : ''
@@ -108,6 +110,11 @@ export function pushEntryOf(rows, label) {
         ...row.system !== undefined ? { role: 'system', kind: '渠道提醒' } : { role: 'assistant', kind: '中途发给用户' },
         text: `${by}${body}${sent ? '' : '\n\n（没有发出去）'}`,
     }
+}
+
+/** 一次中途发送的几片拼成的文字；图片、语音写占位。 */
+function pushBodyOf(parts) {
+    return parts.map(part => (part.kind === 'voice' ? '[语音]' : part.kind === 'image' ? '[图片]' : String(part.text ?? ''))).join('\n').trim()
 }
 
 /** 渠道自己放进会话的通知（群没接上、群解绑过、群接的会话不在了）的来源；登记在插件入口。 */
@@ -148,7 +155,6 @@ export const GROUP_NOTICES = Object.freeze({
     unbound: () => '（这个群已经解绑，在这里说的话我先不处理了。要重新接上，跟我说一声。）',
     gone: (title, reason) => `（这个群原来接的「${title}」${reason === 'deleted' ? '已经删除了' : '已经归档了'}，刚才的话我先转到中枢。要改接哪个会话，直接说一声。）`,
 })
-const QQ_PASSIVE_REPLY_LIMIT = 4
 /** 留待下次的片超过这么久还没发出就不再发。 */
 const DEFERRED_TTL_MS = 24 * 60 * 60 * 1000
 /** 留待下次的片的投递身份从这里编号，不与本批的片重叠。 */
@@ -162,6 +168,8 @@ const DETOUR_PART_BASE = 2000
 const REROUTE_PART_BASE = 3000
 /** 改道的是图片、文件、语音时在它前面插的那片说明：从这里加上原来那一片的位置编号，重启后认得出已经插过。 */
 const REROUTE_NOTE_PART_BASE = 6000
+/** 平台拒收、又没有别的渠道能接，留到对方下一条消息之后的片：投递身份从这里加上原来那一片的位置编号。 */
+const HELD_PART_BASE = 4000
 /** 没有渠道能发文件时按文字发出的文本文件：扩展名与大小上限。 */
 const TEXT_FILE_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.text', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log'])
 const TEXT_FILE_LIMIT = 64 * 1024
@@ -1330,7 +1338,7 @@ export async function createChannelRuntime(ctx, options) {
         // 选路只剩断开的这个平台自己时不发：发不出去，还会留下一条未送达记录。
         const picked = pickReplyAnchor(sessionScope(binding.sessionId), { need: 2 })
         if (picked === null || picked.binding.bindingId === binding.bindingId) return
-        if (picked.binding.platform === 'qq' && qqRepliesLeft(picked.anchorKey) < 2) return
+        if ((repliesLeftOn(picked.binding.platform, picked.anchorKey) ?? 2) < 2) return
         // 渠道自己的固定说明：带 system 标记，不算回答了对方的消息。一次断开一个键：发出或结果不明就算告过（不重发），
         // 确定没发出的下次对账再试。
         const key = `${state.platform}-down-${state.downSince}`
@@ -1941,6 +1949,32 @@ export async function createChannelRuntime(ctx, options) {
         const entry = pushEntryOf(rows, labelOf(binding.platform))
         if (entry === null) return
         track(Promise.resolve().then(() => config.pushed(entry))).catch(() => {})
+    }
+
+    /**
+     * 这段时间里这个会话中途发到用户手上的话（出口的 `sentBetween`，交接带最近几轮原文时用）。只算会话自己发的、
+     * 确实到了用户手上的片：渠道自己的说明、外部调用方经端点发的不算；改道发出的算在原来那一片上。
+     * @returns `[{ at, text }]`，`at` 是发送时刻（毫秒）。
+     */
+    function sentBetween(sessionId, from = 0, to = Infinity) {
+        const sends = new Map()
+        for (const [, raw] of readEntries(tables.outgoing)) {
+            const parsed = outgoingSchema.safeParse(raw)
+            if (!parsed.success) continue
+            const row = parsed.data
+            if (row.push !== true || row.sessionId !== sessionId || row.system !== undefined || row.by?.kind === 'external') continue
+            if ((row.partIndex ?? 0) >= REROUTE_PART_BASE || row.endSeq < from || row.endSeq > to) continue
+            const send = sends.get(row.endSeq) ?? []
+            send.push(row)
+            sends.set(row.endSeq, send)
+        }
+        const out = []
+        for (const [at, rows] of sends) {
+            const delivered = rows.filter(deliveredRow).sort((left, right) => (left.partIndex ?? 0) - (right.partIndex ?? 0))
+            const body = pushBodyOf(delivered)
+            if (body !== '') out.push({ at, text: delivered.length < rows.length ? `${body}\n（这次发送有一部分没发出去）` : body })
+        }
+        return out.sort((left, right) => left.at - right.at)
     }
 
     /**
@@ -2589,11 +2623,15 @@ export async function createChannelRuntime(ctx, options) {
     /**
      * 按到达先后排好的一组新到原件还要等多久才准入（毫秒，≤ 0 表示现在就准入）：最后一条之后安静 `mergeTextMs`
      * （只有图片时 `mergeImageMs`），来一条顺延一次；但从第一条算起不超过 `mergeCapMs`，免得一直有新的来就一直不交。
+     * 平台可以声明自己的 `mergeTextMs`、`mergeImageMs`（比如读消息本身就慢的平台要等得久一点），没声明的用这里的。
      */
     function mergeWait(rows) {
         const newest = rows[rows.length - 1]
         const imageOnly = newest.text !== null && newest.text.trim() === '' && (newest.images?.length ?? 0) > 0
-        const quiet = (imageOnly ? config.mergeImageMs : config.mergeTextMs) - (config.now() - newest.createdAt)
+        const declared = config.platforms[newest.platform]
+        const own = imageOnly ? declared?.mergeImageMs : declared?.mergeTextMs
+        const window = Number.isSafeInteger(own) && own >= 0 ? own : imageOnly ? config.mergeImageMs : config.mergeTextMs
+        const quiet = window - (config.now() - newest.createdAt)
         if (config.mergeCapMs === null) return quiet
         return Math.min(quiet, config.mergeCapMs - (config.now() - rows[0].createdAt))
     }
@@ -2987,7 +3025,15 @@ export async function createChannelRuntime(ctx, options) {
                 })
                 if (outcome.state !== 'failed') return outcome.state
                 // 调了平台、平台确定没发出：和渠道自己拦下的分开（只对这种改道，也只数这种）。
-                noteSendResult(binding, false)
+                if (config.platforms[binding.platform]?.rejectEndsReplies === true && outcome.code === 'SEND_REJECTED') {
+                    // 拒的是这条消息，不是这个账号：不算进暂停，对方再说一句就能接着发。说一次，带上平台的原话。
+                    const sent = usedReplies(prepared.anchorKey)
+                    reportSafely(CHANNEL_REPORTS.repliesEnded, {
+                        ...isNonEmptyString(binding.sessionId) ? { sessionId: binding.sessionId } : {},
+                        text: `${bindingWord(binding)}拒收了（${error?.message ?? outcome.code}）：这条消息已送达 ${sent} 片${sent === 0 ? '，一片都没发出去，可能不是次数的问题' : ''}`,
+                        data: { subject: prepared.anchorKey, delivered: sent },
+                    })
+                } else noteSendResult(binding, false, error?.message)
                 return 'rejected'
             } finally {
                 peerLastSendAt.set(peerKey, config.now())
@@ -3036,7 +3082,57 @@ export async function createChannelRuntime(ctx, options) {
     async function sendPiece(state, binding, batch, deliveryId, prepared) {
         const outcome = await sendPrepared(state, binding, batch, deliveryId, prepared, { mayYield: true })
         if (outcome !== 'rejected' && outcome !== 'paused') return outcome
-        return await rerouteRejected(binding, deliveryId) ?? 'failed'
+        return await rerouteRejected(binding, deliveryId) ?? await holdRejected(binding, deliveryId) ?? 'failed'
+    }
+
+    /**
+     * 平台拒收了这条消息的回复（`rejectEndsReplies`），又没有别的渠道能接：这一片留到对方下一条消息之后，告诉会话一句。
+     * 原来那一片记 `reroutedTo` 指向留待片：它发出就算这一片送到了，还没发时不算未送达。
+     * @returns `held`；这一片不该留时为 null。
+     */
+    async function holdRejected(binding, deliveryId) {
+        const row = readOutgoing(deliveryId)
+        const declared = config.platforms[binding.platform]
+        if (row === null || declared?.rejectEndsReplies !== true || declared.holdsUntilNextMessage !== true) return null
+        // 本来就是留待片，补发时又被拒：回去接着等下一条消息（错误码留着，这条消息算回不了了；发出时清掉）。
+        if (row.deferred === true && row.state === 'failed' && row.errorCode === 'SEND_REJECTED') {
+            await putOutgoing(deliveryId, { ...row, state: 'prepared' })
+            return 'held'
+        }
+        if (row.state !== 'failed' || row.errorCode !== 'SEND_REJECTED' || row.reroutedTo !== undefined || row.detour === true || row.system !== undefined) return null
+        const heldId = await holdPart(binding, row, row.partIndex, { kind: row.kind, text: row.text }, `${row.push === true ? '中途发送' : `第 ${row.turn} 轮回复`}：${labelOf(binding.platform)}这条消息回不了了，留到用户下一条消息之后接着发，不用重发`)
+        await putOutgoing(deliveryId, { ...row, reroutedTo: heldId })
+        return 'held'
+    }
+
+    /** 记一片留到对方下一条消息之后的片；按原来的投递和位置编号，记过就不再记。 */
+    async function holdPart(binding, origin, position, part, routeNote) {
+        const heldId = deliveryIdOf(origin, HELD_PART_BASE + position)
+        if (readOutgoing(heldId) !== null) return heldId
+        const at = config.now()
+        await putOutgoing(heldId, {
+            bindingId: binding.bindingId,
+            sessionId: origin.sessionId,
+            turn: 0,
+            endSeq: at,
+            sourceSeqs: origin.sourceSeqs,
+            inputRequestIds: origin.inputRequestIds,
+            anchorKey: origin.anchorKey,
+            partIndex: HELD_PART_BASE + position,
+            partCount: 1,
+            ...part.kind === undefined ? {} : { kind: part.kind },
+            ...routeNote === undefined ? {} : { routeNote },
+            ...origin.push === true ? { push: true } : {},
+            ...origin.by === undefined ? {} : { by: origin.by },
+            text: part.text,
+            state: 'prepared',
+            receipt: null,
+            errorCode: null,
+            detour: true,
+            deferred: true,
+            deferredAt: at,
+        })
+        return heldId
     }
 
     /**
@@ -3130,7 +3226,7 @@ export async function createChannelRuntime(ctx, options) {
      * 记一片调了平台以后的确定结果（按绑定，不按平台名）：发出了就清零，暂停着的就此恢复；平台确定没发出就数一次，连着
      * `pauseRejects` 片没发出、或到点后试的那一片又没发出，就暂停 `pauseMs`。结果不明的不数：可能已经发出。不设时间窗口，不倍增。
      */
-    function noteSendResult(binding, sent) {
+    function noteSendResult(binding, sent, detail) {
         if (config.pauseRejects === 0) return
         const entry = sendPauses.get(binding.bindingId)
         if (sent) {
@@ -3149,7 +3245,8 @@ export async function createChannelRuntime(ctx, options) {
             return
         }
         if (next.until === null && next.misses < config.pauseRejects) return
-        const why = next.until === null ? `连着 ${next.misses} 片被平台确定没发出` : '到点后试发的一片又被平台确定没发出'
+        const said = typeof detail === 'string' && detail !== '' ? `（${detail}）` : ''
+        const why = next.until === null ? `连着 ${next.misses} 片被平台确定没发出${said}` : '到点后试发的一片又被平台确定没发出'
         next.until = now + config.pauseMs
         reportSafely(CHANNEL_REPORTS.accountPaused, {
             ...isNonEmptyString(binding.sessionId) ? { sessionId: binding.sessionId } : {},
@@ -3415,11 +3512,11 @@ export async function createChannelRuntime(ctx, options) {
     }
 
     /**
-     * QQ 一条消息只能被动回复有限几次：超出这一批还能用的次数时，发出前几片，并告诉对方还有多少、
+     * 有的平台（声明 `replyLimit`）一条消息只能回有限几次：超出这一批还能用的次数时，发出前几片，并告诉对方还有多少、
      * 什么时候接着发，其余留到对方下一条消息之后。说明接在发出的最后一段文字后面，没有文字片时才单占一片。
      * 一片也发不了时整批留待。完整回复保留在 DSH 会话里。
      */
-    function fitQQReply(parts, available) {
+    function fitReply(platform, parts, available) {
         if (parts.length <= available) return { parts, deferred: [] }
         if (available <= 0) return { parts: [], deferred: parts }
         const lastText = parts.slice(0, available).findLastIndex(part => part.kind === undefined)
@@ -3432,7 +3529,8 @@ export async function createChannelRuntime(ctx, options) {
             count('file') > 0 ? `${count('file')} 个文件` : '',
             texts > 0 ? `${texts} 段文字` : '',
         ].filter(Boolean).join('、')
-        const notice = `（QQ 每条消息只能回 ${QQ_PASSIVE_REPLY_LIMIT} 次，还有${left}没发；你下一条消息回完后我接着发，完整内容也在 DSH 桌面。）`
+        const { replyLimit, replyLimitLabel } = config.platforms[platform]
+        const notice = `（${replyLimitLabel} 每条消息只能回 ${replyLimit} 次，还有${left}没发；你下一条消息回完后我接着发，完整内容也在 DSH 桌面。）`
         if (lastText < 0) return { parts: [...kept, { text: notice }], deferred: rest }
         const withNotice = kept.map((part, index) => index === lastText ? { text: `${part.text.trimEnd()}\n\n${notice}` } : part)
         return { parts: withNotice, deferred: rest }
@@ -3450,12 +3548,28 @@ export async function createChannelRuntime(ctx, options) {
      * 这个 QQ 锚点还剩几次被动回复。借用别人的锚点（转交、中途发送、补发）时，超出被动回复窗口就是 0。
      * `own` 表示这一批正是在回复这条消息。
      */
-    function qqRepliesLeft(anchorKey, { skip, own = false } = {}) {
+    /** 这条消息有没有被平台拒收过。 */
+    function anchorRejected(anchorKey) {
+        for (const [, raw] of readEntries(tables.outgoing)) {
+            const parsed = outgoingSchema.safeParse(raw)
+            if (parsed.success && parsed.data.anchorKey === anchorKey && parsed.data.errorCode === 'SEND_REJECTED') return true
+        }
+        return false
+    }
+
+    /** 对方的消息过了多久就不能再借它回复：平台声明的，没声明时是配置的转交窗口。 */
+    const replyWindowOf = platform => config.platforms[platform]?.replyWindowMs ?? config.qqRelayWindowMs
+
+    /** 这条消息在这个平台还能回几次；平台没有次数限制时是 `null`。 */
+    function repliesLeftOn(platform, anchorKey, { skip, own = false } = {}) {
+        const limit = config.platforms[platform]?.replyLimit
+        if (limit === undefined) return null
+        if (config.platforms[platform].rejectEndsReplies === true && anchorRejected(anchorKey)) return 0
         if (!own) {
             const owner = anchorOwner(anchorKey)
-            if (owner === undefined || config.now() - owner.createdAt > config.qqRelayWindowMs) return 0
+            if (owner === undefined || config.now() - owner.createdAt > replyWindowOf(platform)) return 0
         }
-        return Math.max(QQ_PASSIVE_REPLY_LIMIT - usedReplies(anchorKey, skip), 0)
+        return Math.max(limit - usedReplies(anchorKey, skip), 0)
     }
 
     /** 批的输入里有没有不是转交的输入：等待提醒也是在回复对方那条消息。 */
@@ -3605,7 +3719,7 @@ export async function createChannelRuntime(ctx, options) {
                 now: config.now(),
                 live: bindingLive(binding),
                 lastInputAt: latest === undefined ? null : latest.createdAt,
-                repliesLeft: anchorKey === null ? 0 : qqRepliesLeft(anchorKey),
+                repliesLeft: anchorKey === null ? 0 : repliesLeftOn(binding.platform, anchorKey),
             },
         }
     }
@@ -3757,8 +3871,11 @@ export async function createChannelRuntime(ctx, options) {
         return anchoredCandidates(others).find(candidate => deliverableNow(candidate.binding, need) && canCarry(candidate.binding, kind)) ?? null
     }
 
-    /** 发出改道的片：记在承载它的渠道名下，锚定对方在那里最近的一条消息。 */
-    async function sendDetours(sessionId, detours) {
+    /**
+     * 发出改道的片：记在承载它的渠道名下，锚定对方在那里最近的一条消息。
+     * @param fields - 记进每一片的字段：中途发送改道的片还是那次发送的一部分，带 `push`、`by` 和那次的 `endSeq`。
+     */
+    async function sendDetours(sessionId, detours, fields = {}) {
         for (const { index, deliveryId, part, carrier, note } of detours) {
             if (closing) return
             let stored = readOutgoing(deliveryId)
@@ -3783,6 +3900,7 @@ export async function createChannelRuntime(ctx, options) {
                     errorCode: null,
                     detour: true,
                     ...note === undefined ? {} : { routeNote: note },
+                    ...fields,
                 }
                 await putOutgoing(deliveryId, stored)
             }
@@ -3971,10 +4089,10 @@ export async function createChannelRuntime(ctx, options) {
             const whole = routed.parts
             // 已经开始投递的一批沿用当时的片数：只在首次投递时按剩余额度切分，不给早已发完的旧批补出留待片。
             // 转交的回复借用对方最近一条消息的额度，那条消息过了被动回复窗口时整批留到对方下一条消息之后。
-            const fitted = binding.platform === 'qq'
-                ? fitQQReply(whole, existing.length > 0
+            const fitted = config.platforms[binding.platform]?.replyLimit !== undefined
+                ? fitReply(binding.platform, whole, existing.length > 0
                     ? existing[0].record.partCount
-                    : qqRepliesLeft(batch.anchorKey, { skip: batch, own: batch.mainTurn !== true && answersOwnInput(batch) }))
+                    : repliesLeftOn(binding.platform, batch.anchorKey, { skip: batch, own: batch.mainTurn !== true && answersOwnInput(batch) }))
                 : { parts: whole, deferred: [] }
             return { ...fitted, detours: routed.detours }
         }
@@ -4083,6 +4201,13 @@ export async function createChannelRuntime(ctx, options) {
             // 首片之后 source 被撤下/压缩、或 owner 变动，由 sendPrepared 的最后一步发现并停批。
             // 平台确定没发出的片改道发出后接着发下一片；没送到就停批。
             const outcome = await sendPiece(state, binding, batch, deliveryId, prepared)
+            if (outcome === 'held') {
+                // 这条消息回不了了：后面的片不再碰平台，一起留到对方下一条消息之后。
+                for (let rest = index + 1; rest < chunks.length; rest += 1) {
+                    if (readOutgoing(deliveryIdOf(base, rest)) === null) await holdPart(binding, base, rest, { kind: parts[rest].kind, text: chunks[rest] })
+                }
+                return
+            }
             if (outcome !== 'sent') return
         }
         await sendDetours(binding.sessionId, fitted.detours)
@@ -4423,7 +4548,7 @@ export async function createChannelRuntime(ctx, options) {
      * 说明已经在桌面上看过，不再补发，也不当作未送达告诉助手。
      */
     async function drainDeferred(state, binding, desktop = null) {
-        if (binding.platform !== 'qq') return
+        if (config.platforms[binding.platform]?.replyLimit === undefined) return
         const waiting = []
         for (const [deliveryId, raw] of readEntries(tables.outgoing)) {
             const parsed = outgoingSchema.safeParse(raw)
@@ -4442,11 +4567,13 @@ export async function createChannelRuntime(ctx, options) {
         }
         if (waiting.length === 0) return
         const latest = latestRealInput(binding)
-        if (latest === undefined || config.now() - latest.createdAt > config.qqRelayWindowMs) return
+        const limit = config.platforms[binding.platform]?.replyLimit
+        if (limit === undefined || latest === undefined || config.now() - latest.createdAt > replyWindowOf(binding.platform)) return
         const anchorKey = latest.replyAnchorKey ?? latest.anchorKey
         const used = usedReplies(anchorKey)
         if (used === 0) return
-        let free = QQ_PASSIVE_REPLY_LIMIT - used
+        if (config.platforms[binding.platform].rejectEndsReplies === true && anchorRejected(anchorKey)) return
+        let free = limit - used
         const due = waiting
             .filter(item => (item.row.deferredAt ?? 0) <= latest.createdAt)
             .sort((left, right) => (left.row.deferredAt - right.row.deferredAt)
@@ -4613,8 +4740,8 @@ export async function createChannelRuntime(ctx, options) {
         })
         const parts = routed.parts.map(({ routeNote, ...part }) => part)
         const routeNotes = [...routed.parts.map(part => part.routeNote), ...routed.detours.map(detour => detour.note)].filter(note => note !== undefined)
-        // QQ 给这一轮的最终回复留一次。
-        const left = binding.platform === 'qq' ? qqRepliesLeft(anchorKey) : null
+        // 有次数限制的平台给这一轮的最终回复留一次。
+        const left = repliesLeftOn(binding.platform, anchorKey)
         if (left !== null && left < 2) return { status: 'unavailable', reason: 'NO_REPLIES_LEFT', repliesLeft: left }
         const state = stateOf(binding.platform)
         const allowed = left === null ? parts.length : Math.min(parts.length, left - 1)
@@ -4628,6 +4755,7 @@ export async function createChannelRuntime(ctx, options) {
             anchorKey,
         }
         let sent = 0
+        let held = 0
         let failed = 0
         for (let index = 0; index < allowed; index += 1) {
             if (closing) break
@@ -4645,7 +4773,12 @@ export async function createChannelRuntime(ctx, options) {
                 ...by === undefined ? {} : { by },
             }
             await putOutgoing(deliveryId, prepared)
-            if (await sendPiece(state, binding, null, deliveryId, prepared) !== 'sent') {
+            const outcome = await sendPiece(state, binding, null, deliveryId, prepared)
+            if (outcome === 'held') {
+                held += 1
+                continue
+            }
+            if (outcome !== 'sent') {
                 failed += 1
                 continue
             }
@@ -4656,7 +4789,7 @@ export async function createChannelRuntime(ctx, options) {
             if (via !== undefined) routeNotes.push(reroutedNoteOf(row, binding.platform, via))
         }
         reportPushed(binding, sessionId, stamp)
-        await sendDetours(sessionId, routed.detours.map(({ note, ...detour }) => detour))
+        await sendDetours(sessionId, routed.detours.map(({ note, ...detour }) => detour), { endSeq: stamp, push: true, ...by === undefined ? {} : { by } })
         for (const { deliveryId } of routed.detours) {
             if (readOutgoing(deliveryId)?.state === 'sent') sent += 1
             else failed += 1
@@ -4666,8 +4799,8 @@ export async function createChannelRuntime(ctx, options) {
             platform: binding.platform,
             sent,
             failed,
-            unsent: parts.length - allowed,
-            repliesLeft: binding.platform === 'qq' ? QQ_PASSIVE_REPLY_LIMIT - usedReplies(anchorKey) : null,
+            unsent: parts.length - allowed + held,
+            repliesLeft: repliesLeftOn(binding.platform, anchorKey, { own: true }),
             ...routeNotes.length > 0 ? { routed: routeNotes } : {},
         }
     }
@@ -4685,7 +4818,7 @@ export async function createChannelRuntime(ctx, options) {
         // 每条消息只说一次：同一锚点再次断网不重复。
         const key = `stall-${picked.anchorKey}`
         if (systemNoticeExists(key)) return { status: 'skipped' }
-        if (picked.binding.platform === 'qq' && qqRepliesLeft(picked.anchorKey) < 2) return { status: 'unavailable', reason: 'NO_REPLIES_LEFT' }
+        if ((repliesLeftOn(picked.binding.platform, picked.anchorKey) ?? 2) < 2) return { status: 'unavailable', reason: 'NO_REPLIES_LEFT' }
         // 渠道自己的固定说明：带 system 标记，不算回答了这条消息，额度说明与“没人回”的检查照常看得到它还在等。
         const status = await sendSystem(picked.binding, text, { key, system: 'stall', anchor: picked.anchorKey })
         return { status, platform: picked.binding.platform }
@@ -4708,7 +4841,7 @@ export async function createChannelRuntime(ctx, options) {
             // 同中枢的回复：按配置的先后（`replyOrder`）；没走第一位时按 `rerouteNote` 开头注明。
             const picked = pickReplyAnchor(bindings, { need: 2, prefer: config.replyOrder })
             if (picked === null) return { status: 'unavailable', reason: 'NO_REPLY_ANCHOR' }
-            if (picked.binding.platform === 'qq' && qqRepliesLeft(picked.anchorKey) < 2) return { status: 'unavailable', reason: 'NO_REPLIES_LEFT' }
+            if ((repliesLeftOn(picked.binding.platform, picked.anchorKey) ?? 2) < 2) return { status: 'unavailable', reason: 'NO_REPLIES_LEFT' }
             const note = rerouteNote(picked.binding)
             const status = await sendSystem(picked.binding, note === null ? text : `${note}\n${text}`, { key, system: 'quota', anchor: picked.anchorKey })
             return { status, platform: picked.binding.platform }
@@ -5706,6 +5839,7 @@ export async function createChannelRuntime(ctx, options) {
         groupOfSession,
         undelivered,
         exitSessions,
+        sentBetween,
         /** 当前启用绑定指向的会话；只有它们的助手需要知道渠道的等待约定。 */
         boundSessionIds() {
             const ids = new Set()

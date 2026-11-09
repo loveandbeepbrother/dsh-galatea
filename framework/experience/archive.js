@@ -8,6 +8,8 @@
  *   重算只动这个来源这一部分、这条时间线里的条目），`source` 是来源所属的大类（检索时按它筛）。
  * - 编号是来源给的完整编号，这里只检查全库唯一：别的来源已经用了的编号拒收。
  * - 关联编号由生产方给，这里不按正文猜。旧数据里的 `inferred_link` 照样读作关联编号。
+ * - `usage`：记忆、便签、文档段、经历被搜到、被打开的次数和最后时刻，按调用方的角色分开记（后台整理会把一大批都搜一遍，
+ *   混在一起就分不出哪些真被用到）。和经历放在一起是因为数据备份本来就覆盖这个文件；编号是各来源自己的编号。
  *
  * @module @loveandbeepbrother/dsh-galatea/experience/archive
  */
@@ -72,6 +74,17 @@ create index if not exists ops_order on ops(session_id, at);
 create index if not exists ops_link on ops(link);
 create table if not exists entry_vectors (id text primary key, hash text not null, model text not null, vector blob not null);
 create table if not exists cursors (key text primary key, value text not null);
+create table if not exists usage (
+    source text not null,
+    ref text not null,
+    role text not null,
+    shown integer not null default 0,
+    last_shown integer,
+    opened integer not null default 0,
+    last_opened integer,
+    first_at integer not null,
+    primary key (source, ref, role)
+) without rowid;
 `
 
 /** 参与向量的角色：说的话与发出的消息；标记与系统转交不算。 */
@@ -115,7 +128,9 @@ export function openArchive(path) {
         get: db.prepare('select * from entries where id = ?'),
         hash: db.prepare('select hash from entries where id = ?'),
         owner: db.prepare('select origin, session_id from entries where id = ?'),
-        insert: db.prepare(`insert into entries (${columns}) values (:id, :source, :session_id, :origin, :title, :place, :at, :tie,
+        // 没写标题的（启动以后一条条收进来的，只有整份读才知道标题）沿用这个会话已有的标题；会话改名由 `retitle` 整条跟着改。
+        insert: db.prepare(`insert into entries (${columns}) values (:id, :source, :session_id, :origin,
+            coalesce(:title, (select title from entries where session_id = :session_id and title is not null limit 1)), :place, :at, :tie,
             :role, :kind, :text, :link, null, :party, :model, :turn, :tkey, :hash, :vhash)`),
         update: db.prepare(`update entries set origin = :origin, title = coalesce(:title, title), place = coalesce(:place, place), at = :at, tie = :tie, role = :role,
             kind = :kind, text = :text, link = :link, party = :party, model = :model, turn = :turn, tkey = :tkey, hash = :hash,
@@ -152,12 +167,20 @@ export function openArchive(path) {
             and (:kind is null or kind = :kind) order by at desc, tie desc, id desc limit 1`),
         firstAtOrAfter: db.prepare('select * from entries where session_id = ? and at >= ? order by at, tie, id limit 1'),
         lastBefore: db.prepare('select * from entries where session_id = ? and at < ? order by at desc, tie desc, id desc limit 1'),
+        indexPage: db.prepare("select rowid, id, session_id, role, kind, at, text, hash, source, coalesce(link, inferred_link) as link from entries where rowid > ? and role in ('user', 'assistant', 'out', 'peer') order by rowid limit ?"),
+        indexKeys: db.prepare("select id as ref, hash, coalesce(link, inferred_link) as link from entries where role in ('user', 'assistant', 'out', 'peer')"),
+        indexEntry: db.prepare('select rowid, id, session_id, role, kind, at, text, hash, source, coalesce(link, inferred_link) as link from entries where id = ?'),
+        opsPage: db.prepare('select rowid, id, session_id, at, tool, detail from ops where rowid > ? order by rowid limit ?'),
+        opsKeys: db.prepare('select id as ref, tool, detail from ops'),
+        indexOp: db.prepare('select rowid, id, session_id, at, tool, detail from ops where id = ?'),
+        spokenSince: db.prepare("select * from entries where session_id = ? and at > ? and role in ('user', 'assistant', 'out', 'peer') order by at desc, tie desc, id desc limit 20000"),
+        lastInputBefore: db.prepare("select * from entries where session_id = ? and role = 'user' and at < ? and length(text) between 12 and 2000 order by at desc, tie desc, id desc limit 1"),
         sessionInfo: db.prepare('select source, title, place from entries where session_id = ? order by title is null, at desc limit 1'),
         stale: db.prepare(`select e.id, e.vhash, e.kind, e.text from entries e left join entry_vectors v on v.id = e.id
             where e.role in ${EMBEDDED_ROLES} and length(e.text) >= 2 and (v.id is null or v.hash <> e.vhash or v.model <> ?) limit ?`),
         putVector: db.prepare(`insert into entry_vectors (id, hash, model, vector) values (?, ?, ?, ?)
             on conflict(id) do update set hash = excluded.hash, model = excluded.model, vector = excluded.vector`),
-        vectors: db.prepare(`select v.id, v.hash, v.vector, e.source, e.session_id, e.at from entry_vectors v join entries e on e.id = v.id
+        vectors: db.prepare(`select v.id, v.hash, v.vector, e.source, e.session_id, e.at, coalesce(e.link, e.inferred_link) as link from entry_vectors v join entries e on e.id = v.id
             where v.model = ? and v.hash = e.vhash`),
         count: db.prepare(`select count(*) as entries,
             (select count(*) from entries where role in ${EMBEDDED_ROLES} and length(text) >= 2) as embeddable,
@@ -317,10 +340,55 @@ export function openArchive(path) {
 
     const key = row => ({ session: row.session_id, at: row.at, tie: row.tie, id: row.id })
 
+    const usageBump = {
+        shown: db.prepare(`insert into usage (source, ref, role, shown, last_shown, first_at) values (?, ?, ?, 1, ?, ?)
+            on conflict(source, ref, role) do update set shown = shown + 1, last_shown = excluded.last_shown`),
+        opened: db.prepare(`insert into usage (source, ref, role, opened, last_opened, first_at) values (?, ?, ?, 1, ?, ?)
+            on conflict(source, ref, role) do update set opened = opened + 1, last_opened = excluded.last_opened`),
+    }
+    const inList = (column, values, params, prefix) => {
+        const names = values.map((value, index) => {
+            params[`${prefix}${index}`] = String(value)
+            return `:${prefix}${index}`
+        })
+        return `${column} in (${names.join(', ')})`
+    }
+
+    /**
+     * 使用统计的汇总：同一条按选中的角色加起来。
+     * @param options.order - `most`（搜到加打开最多的在前）或 `least_recent`（最后一次用到最早的在前）。
+     */
+    function usage({ sources = null, roles = null, refs = null, order = 'most', limit = 20 } = {}) {
+        const where = []
+        const params = { limit }
+        if (sources !== null) where.push(inList('source', sources, params, 's'))
+        if (roles !== null) where.push(inList('role', roles, params, 'r'))
+        if (refs !== null) where.push(inList('ref', refs, params, 'f'))
+        const ordering = order === 'least_recent'
+            ? 'max(coalesce(max(last_shown), 0), coalesce(max(last_opened), 0)) asc'
+            : 'sum(shown) + sum(opened) desc, max(coalesce(max(last_shown), 0), coalesce(max(last_opened), 0)) desc'
+        return db.prepare(`select source, ref, sum(shown) as shown, sum(opened) as opened, max(last_shown) as last_shown,
+            max(last_opened) as last_opened, min(first_at) as first_at from usage ${where.length > 0 ? `where ${where.join(' and ')}` : ''}
+            group by source, ref order by ${ordering} limit :limit`).all(params)
+    }
+
     return {
         db,
         write,
         keyword,
+        /** 这几条被搜到（`shown`）或被打开（`opened`）一次，记在调用方的角色下；同一批里重复的编号算一次。 */
+        noteUsage(source, refs, kind, role, at = Date.now()) {
+            const statement = usageBump[kind]
+            if (statement === undefined) throw new TypeError('kind 只能是 shown 或 opened')
+            transaction(() => {
+                for (const ref of new Set(refs.map(String))) statement.run(String(source), ref, String(role), at, at)
+            })
+        },
+        usage,
+        /** 有使用记录的编号（某个来源、选中的角色）。 */
+        usedRefs: (source, roles = null) => new Set(usage({ sources: [source], roles, limit: Number.MAX_SAFE_INTEGER }).map(row => row.ref)),
+        /** 统计从什么时候开始记（最早一条的时刻），还没有记录时是 `null`。 */
+        usageSince: () => db.prepare('select min(first_at) as at from usage').get()?.at ?? null,
         get: id => statements.get.get(id),
         /** 同一会话里这一条之后（不含）的若干条，按顺序。 */
         after: (row, limit) => statements.after.all({ ...key(row), limit }),
@@ -357,6 +425,14 @@ export function openArchive(path) {
         latestMarker: (sessionId, kind) => statements.latestMarker.get({ session: sessionId, kind: kind ?? null }),
         firstAtOrAfter: (sessionId, at) => statements.firstAtOrAfter.get(sessionId, at),
         lastBefore: (sessionId, at) => statements.lastBefore.get(sessionId, at),
+        lastInputBefore: (sessionId, at) => statements.lastInputBefore.get(sessionId, at),
+        spokenSince: (sessionId, at) => statements.spokenSince.all(sessionId, at),
+        indexPage: (after, limit) => statements.indexPage.all(after, limit),
+        indexKeys: () => statements.indexKeys.all(),
+        indexEntry: id => statements.indexEntry.get(id),
+        opsPage: (after, limit) => statements.opsPage.all(after, limit),
+        opsKeys: () => statements.opsKeys.all(),
+        indexOp: id => statements.indexOp.get(id),
         /** 会话的来源、标题与目录（取已有条目里的）。 */
         sessionInfo: sessionId => statements.sessionInfo.get(sessionId),
         /** 某条时间线里属于某个来源、`tie` 不小于给定值的条目编号（重算前看会删掉哪些）。 */
@@ -376,6 +452,7 @@ export function openArchive(path) {
         }),
         /** 还没有当前向量的条目。 */
         stale: (model, limit) => statements.stale.all(model, limit),
+        staleCount: model => statements.stale.all(model, Number.MAX_SAFE_INTEGER).length,
         putVector: (id, hash, model, vector) => statements.putVector.run(id, hash, model,
             new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength)),
         /** 当前模型的全部有效向量，带过滤所需的字段。 */
@@ -385,6 +462,7 @@ export function openArchive(path) {
             source: row.source,
             sessionId: row.session_id,
             at: row.at,
+            link: row.link,
             vector: new Float32Array(row.vector.buffer.slice(row.vector.byteOffset, row.vector.byteOffset + row.vector.byteLength)),
         })),
         stats: () => statements.count.get(),

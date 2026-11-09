@@ -142,6 +142,18 @@ export function createSegments(domain, { systemPrompt, report, roleOf, now = Dat
     }
 
     /**
+     * 体检用：现在开对话会交出的开头段，以及这个会话最近一段对话已经拿到的段。什么也不记；段读不出时照常按 `onError` 处理。
+     * @returns `{ opening: [{ name, text, failed }], delivered: { at, names } | null }`。
+     */
+    async function preview(sessionId) {
+        const id = String(sessionId)
+        const opening = (await computeAll(id, ['opening'])).filter(entry => entry.text !== '').map(({ name, text, failed }) => ({ name, text, failed }))
+        const latest = [...views().entries()].map(([, record]) => record).filter(record => record.sessionId === id)
+            .sort((left, right) => right.at - left.at)[0]
+        return { opening, delivered: latest === undefined ? null : { at: latest.at, names: Object.keys(latest.seen) } }
+    }
+
+    /**
      * 别的执行方每一轮开始时：和这个对话上次看到的比，给出变更说明，并记下这次的版本。
      * @param options.compacted - 这个对话刚压缩过：把对话开始以来改过的段整段补一遍。
      * @returns 变更说明，每段一条；没有变化是空数组。没 `open` 过的对话按刚开对话处理，返回开头的全文。
@@ -275,7 +287,7 @@ export function createSegments(domain, { systemPrompt, report, roleOf, now = Dat
         return 'opening'
     }
 
-    return Object.freeze({ segment, assemble, open, changes, beforeSelfWrite, afterSelfWrite, declareSegment, audienceOf })
+    return Object.freeze({ segment, assemble, open, preview, changes, beforeSelfWrite, afterSelfWrite, declareSegment, audienceOf })
 }
 
 /** 组装时是哪个会话（没有 Agent 的诊断组装为 `undefined`）。 */

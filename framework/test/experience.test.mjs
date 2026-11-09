@@ -14,8 +14,8 @@ const BY = Object.freeze({ kind: 'program', plugin: 'test' })
 const T0 = Date.parse('2026-11-05T10:00:00+08:00')
 const entry = (id, thread, minute, role, kind, text, extra = {}) => ({ id, thread, at: T0 + minute * 60_000, tie: minute, role, kind, text, ...extra })
 
-async function setup(t, { embedder = false } = {}) {
-    const h = await makeHarness(t, { controller: true })
+async function setup(t, { embedder = false, coreConfig } = {}) {
+    const h = await makeHarness(t, { controller: true, coreConfig })
     const reports = []
     h.ctx.core.onReport(item => reports.push(item))
     if (embedder) {
@@ -114,8 +114,10 @@ test('能查的范围：中枢看全部；工作会话只看本项目的会话�
         entry('x1', 'stranger', 5, 'user', '用户', '第三章不相干的事'),
     ])
     const refs = async id => (await h.ctx.experience.search({ query: '第三章' }, who(id))).items.map(item => item.ref).sort()
-    assert.deepEqual(await refs('main'), ['e1', 'e2', 'm1', 'w1', 'x1'])
-    assert.deepEqual(await refs('writer'), ['e1', 'e2', 'w1'], '同一项目的两个会话，别的看不到')
+    // 同一次发送的两份（关联相同）只留一条；串联（thread）照样看得到两边。
+    const linksOf = async id => (await h.ctx.experience.search({ query: '第三章' }, who(id))).items.map(item => item.link ?? item.ref).sort()
+    assert.deepEqual(await linksOf('main'), ['L1', 'L2', 'x1'])
+    assert.deepEqual(await linksOf('writer'), ['L1', 'L2'], '同一项目的两个会话，别的看不到')
     assert.deepEqual(await refs('stranger'), ['x1'], '不在项目里的工作会话只看自己')
     await assert.rejects(h.ctx.experience.read({ sessionId: 'main' }, who('writer')), /看不到会话 main/)
     await assert.rejects(h.ctx.experience.read({ ref: 'm1' }, who('writer')), /没有 m1/)
@@ -126,6 +128,38 @@ test('能查的范围：中枢看全部；工作会话只看本项目的会话�
     const fromHub = await h.ctx.experience.thread({ ref: 'w1' }, who('main'))
     assert.deepEqual(fromHub.items.map(item => item.ref), ['w1', 'e1', 'e2', 'm1'])
     assert.equal(fromHub.note, undefined)
+})
+
+test('时间：结果按核心的时区写、带偏移，另给多久以前；给出的 at 原样传回 since、until 是同一刻；不带偏移的按核心的时区', async (t) => {
+    const { h, who } = await setup(t, { coreConfig: { timezone: 'America/New_York' } })
+    const s = h.ctx.experience.registerSource({ id: 'test-s', label: '会话', category: 'dsh' })
+    s.append([
+        entry('a1', 'main', 1, 'user', '用户', '第一句关于风车'),
+        entry('a2', 'main', 2, 'user', '用户', '第二句关于风车'),
+        entry('a3', 'main', 3, 'user', '用户', '第三句关于风车'),
+    ])
+    const search = async args => (await h.ctx.experience.search({ query: '风车', ...args }, who('main'))).items
+    const items = await search({})
+    const second = items.find(item => item.ref === 'a2')
+    assert.equal(second.at, '2026-11-04 21:02-05:00', 'T0 是北京 11-05 10:00，纽约是前一天 21:00')
+    assert.match(second.ago, /前$/)
+    assert.deepEqual((await search({ since: second.at })).map(item => item.ref).sort(), ['a2', 'a3'], 'since 含那一刻')
+    assert.deepEqual((await search({ until: second.at })).map(item => item.ref), ['a1'], 'until 不含那一刻')
+    assert.deepEqual((await search({ since: '2026-11-04 21:03' })).map(item => item.ref), ['a3'], '不带偏移的按核心的时区（纽约）')
+    assert.deepEqual((await search({ since: '2026-11-05T02:03:00Z' })).map(item => item.ref), ['a3'], 'UTC 写法照认')
+    const read = await h.ctx.experience.read({ ref: 'a2', limit: 1 }, who('main'))
+    assert.equal(read.entries[0].at, second.at, '读原文的时间写法一样')
+})
+
+test('标题：后来一条条收进来、没写标题的条目沿用这个会话已有的标题（重启以后的增量不再显示成会话编号）', async (t) => {
+    const { h, who } = await setup(t)
+    const s = h.ctx.experience.registerSource({ id: 'test-s', label: '会话', category: 'dsh' })
+    s.append([entry('t1', 'main', 1, 'user', '用户', '第一句关于钟楼', { title: '日常对话' })])
+    s.append([entry('t2', 'main', 2, 'user', '用户', '第二句关于钟楼')])
+    s.append([entry('t3', 'writer', 3, 'user', '用户', '别的会话关于钟楼')])
+    const where = Object.fromEntries((await h.ctx.experience.search({ query: '钟楼' }, who('main'))).items.map(item => [item.ref, item.where]))
+    assert.match(where.t2, /「日常对话」/)
+    assert.doesNotMatch(where.t3, /日常对话/, '别的会话不沾')
 })
 
 test('语义检索：向量后台补算；没有字面命中也能按意思找到；没有向量提供方只按关键词并写明', async (t) => {
@@ -143,4 +177,85 @@ test('语义检索：向量后台补算；没有字面命中也能按意思找�
     const plain = await bare.h.ctx.experience.search({ query: '样本猫' }, bare.who('main'))
     assert.deepEqual(plain.items.map(item => item.ref), ['c1'])
     assert.match(plain.note, /没有向量提供方，只做了关键词检索/)
+})
+
+test('交接整理的摘录：从上次边界起，只要说的话；截短、带编号，超上限留最新的；快照和系统条目不要', async (t) => {
+    const { h } = await setup(t)
+    const source = h.ctx.experience.registerSource({ id: 'digest', label: '来源', category: 'dsh' })
+    source.append([
+        entry('d0', 'main', 1, 'user', '用户·桌面', '边界之前说的'),
+        entry('d1', 'main', 2, 'system', '交接', '交接到新对话'),
+        entry('d2', 'main', 3, 'user', '用户·桌面', `用户说的长话${'字'.repeat(2500)}`),
+        entry('d3', 'main', 4, 'system', '系统', 'Current runtime context. 一大段快照'),
+        entry('d4', 'main', 5, 'user', '用户·桌面', 'Current runtime context. 混在用户条目里的快照'),
+        entry('d5', 'main', 6, 'assistant', '回复', '助手的回复'),
+        entry('d6', 'main', 7, 'assistant', '思考', '助手的思考'),
+        entry('d7', 'main', 8, 'out', '发往手机', '发到手机的话'),
+        entry('d8', 'main', 9, 'peer', '项目会话转来', '项目回报'),
+    ])
+    const all = h.ctx.experience.digest('main', { maxChars: 60_000 })
+    assert.equal(all.entries, 4)
+    assert.equal(all.omitted, 0)
+    assert.doesNotMatch(all.text, /边界之前|一大段快照|混在用户条目|助手的思考/)
+    assert.match(all.text, /……（共 2506 字）/)
+    assert.ok(all.text.indexOf('用户说的长话') < all.text.indexOf('项目回报'), '按时间顺序')
+    assert.match(all.text, /d5\] 助手的回复/)
+
+    const capped = h.ctx.experience.digest('main', { maxChars: 200 })
+    assert.equal(capped.entries, 3, '放不下的最旧的那条不放')
+    assert.equal(capped.omitted, 1)
+    assert.equal(capped.oldestRef, 'd2')
+    assert.doesNotMatch(capped.text, /用户说的长话/)
+})
+
+test('只有操作、没有条目的一批：操作不丢（记录里一段只有工具调用，读取位置已经往前走了，丢了就补不回来）', async (t) => {
+    const { h, who } = await setup(t)
+    let batch = 0
+    const source = h.ctx.experience.registerSource({
+        id: 'test-ops-only', label: '只有操作', category: 'dsh',
+        pull: async () => {
+            batch += 1
+            if (batch === 1) return { entries: [entry('o1', 'doc-ops', 1, 'user', '用户', '先查一下')], cursor: { n: 1 } }
+            if (batch === 2) return { entries: [], ops: [{ id: 'op-only', thread: 'doc-ops', at: T0 + 120_000, tie: 2, tool: 'Grep', detail: '只有工具调用的一批' }], cursor: { n: 2 } }
+            return { entries: [entry('o2', 'doc-ops', 3, 'assistant', '回复', '查完了')], cursor: { n: 3 } }
+        },
+    })
+    t.after(() => source.dispose?.())
+    await waitFor(() => batch >= 1, '第一次拉')
+    await h.ctx.experience.refresh()
+    await h.ctx.experience.refresh()
+    const read = await h.ctx.experience.read({ sessionId: 'doc-ops', at: '2026-11-05' }, who('main'))
+    const reply = read.entries.find(item => item.ref === 'o2')
+    assert.ok(reply.ops?.some(line => line.includes('只有工具调用的一批')), JSON.stringify(reply))
+})
+
+test('向量补算：失败报一次，写进 searched；恢复时报 resolved，searched 不再带错误；之后再坏再报', async (t) => {
+    const { h, who, reports } = await setup(t)
+    let failing = true
+    const fake = await h.ctx.plugin({
+        name: 'test-flaky-embedder',
+        apply: ctx => ctx.provide('embedder', {
+            id: 'flaky', model: 'flaky', dimensions: 2,
+            embed: async (texts) => {
+                if (failing && texts.some(text => text.includes('补算'))) throw new Error('connect ETIMEDOUT')
+                return texts.map(() => Float32Array.from([1, 0]))
+            },
+        }),
+    })
+    t.after(() => fake.dispose())
+    const source = h.ctx.experience.registerSource({ id: 'test-embed', label: '来源', category: 'dsh' })
+    const kinds = () => reports.filter(item => item.kind === 'experience/embed-failed')
+    source.append([entry('e1', 'main', 1, 'user', '用户·桌面', '要补算的第一句')])
+    await waitFor(() => kinds().length === 1, '失败报了')
+    const degraded = await h.ctx.experience.search({ query: '第一句' }, who('main'))
+    assert.equal(degraded.searched.backfillError, 'connect ETIMEDOUT')
+
+    failing = false
+    source.append([entry('e2', 'main', 2, 'user', '用户·桌面', '要补算的第二句')])
+    await waitFor(() => kinds().some(item => item.data?.resolved === true), '恢复时关掉')
+    await waitFor(async () => (await h.ctx.experience.search({ query: '第一句' }, who('main'))).searched.backfillError === undefined, '不再带错误')
+
+    failing = true
+    source.append([entry('e3', 'main', 3, 'user', '用户·桌面', '要补算的第三句')])
+    await waitFor(() => kinds().filter(item => item.data?.resolved !== true).length === 2, '再坏再报')
 })

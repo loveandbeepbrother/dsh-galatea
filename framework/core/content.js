@@ -4,7 +4,9 @@
  * - 根目录是用户自己的内容目录（配置给出），路径都相对它，不许跳出去；框架不写死目录名和文件名。
  * - 一次调用可以改几个文件，提交成一次；`text: null` 是删除。
  * - 整次写入在一条队列里：核对 `baseHash`、写文件、提交三步都在队列里，基于同一版本的两次写入只有先到的过。
- * - 用户手改：写之前，涉及的文件有没提交的改动，先以"用户"身份提交一次。
+ * - 工具以外的改动（用户手改、会话直接改文件，程序分不出是谁）：写之前，涉及的文件有没提交的改动，先单独提交一次，
+ *   写明是工具外改动。工具以外改的、新放进来的文件（比如模板），另由 `sweep` 定时提交，不然它们要等下次工具写才留痕，
+ *   从来不经工具写的文件就一直不在仓库里。
  * - 提交失败就退回：用写之前留下的原始字节写回文件，再 `git reset -- <路径>` 退暂存区（不用 Git 恢复文件：
  *   `autocrlf` 会改字节，模型手里的 `baseHash` 就对不上了）。提交成没成看 HEAD 有没有变。
  * - Git 命令自己计时，到点结束整棵进程树（Windows 上 `git` 可能是一层包装，只结束外层，里层还拿着锁）。
@@ -21,8 +23,10 @@ import { existsSync } from 'node:fs'
 import { mkdir, readdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, normalize, relative, sep } from 'node:path'
 
-const IGNORED = ['*.lock', '*.tmp', '.mind-framework-*.tmp', 'workspace/']
+const IGNORED = ['*.lock', '*.tmp', '.mind-framework-*.tmp', 'workspace/', '*.bak-*']
 const GIT_TIMEOUT_MS = 30_000
+/** 工具以外的改动的作者：程序分不出是用户还是哪个会话改的，不写成用户。 */
+const OUTSIDE_AUTHOR = '工具外改动 <outside@mind-framework.local>'
 
 export class ContentConflictError extends Error {
     constructor(path, expected, actual) {
@@ -54,7 +58,7 @@ export function callerLabel(by) {
  * @param options.timeoutMs - 每条 Git 命令的超时。
  * @param options.starter - 起步模板 `{ 相对路径: 内容 }`：只在内容库第一次建成仓库时写进去，已经有的文件不碰。
  */
-export function createContent({ root, git: gitCommand = 'git', authorName = '助手', userName = '用户', report, timeoutMs = GIT_TIMEOUT_MS, starter = {} }) {
+export function createContent({ root, git: gitCommand = 'git', authorName = '助手', report, timeoutMs = GIT_TIMEOUT_MS, starter = {} }) {
     if (typeof root !== 'string' || !isAbsolute(root)) throw new TypeError('内容库要一个绝对路径的根目录')
     const base = normalize(root)
     let queue = Promise.resolve()
@@ -193,6 +197,13 @@ export function createContent({ root, git: gitCommand = 'git', authorName = '助
                 await runGit(['add', '-A'])
                 await runGit(['commit', '-q', '--allow-empty', '-m', seeded.length === 0 ? '初始化内容库' : `初始化内容库（框架自带的起步模板：${seeded.join('、')}）`])
             }
+            else {
+                // 已有的仓库：框架要忽略的规则后来多了的，补上；用户自己写的不动。
+                const ignore = join(base, '.gitignore')
+                const current = existsSync(ignore) ? await readFile(ignore, 'utf8') : ''
+                const missing = IGNORED.filter(rule => !current.split(/\r?\n/).includes(rule))
+                if (missing.length > 0) await writeFile(ignore, `${current}${current === '' || current.endsWith('\n') ? '' : '\n'}${missing.join('\n')}\n`, 'utf8')
+            }
             repository = { ok: true }
         } catch (error) {
             repository = { ok: false, why: error?.gitMissing ? '找不到 Git' : (error?.message ?? String(error)) }
@@ -203,6 +214,27 @@ export function createContent({ root, git: gitCommand = 'git', authorName = '助
     async function head() {
         const { code, stdout } = await git(['rev-parse', 'HEAD'], { allowFailure: true })
         return code === 0 ? stdout.trim() : null
+    }
+
+    /**
+     * 工具以外改的、新放进来的文件，提交一次，写明是工具外改动（程序分不出是谁改的）。
+     * @returns `{ paths }`：提交了哪些；没有要提交的、没有仓库时是空的。
+     */
+    function sweep() {
+        return serial(async () => {
+            const repo = await ensureRepository()
+            if (!repo.ok) return { paths: [] }
+            try {
+                await git(['add', '-A'])
+                const paths = (await git(['-c', 'core.quotepath=false', 'diff', '--cached', '--name-only'])).stdout.split(/\r?\n/).filter(Boolean)
+                if (paths.length === 0) return { paths: [] }
+                await git(['commit', '-q', `--author=${OUTSIDE_AUTHOR}`, '-m', `工具外改动：${paths.join('、')}`])
+                return { paths }
+            } catch (error) {
+                await git(['reset', '-q'], { allowFailure: true }).catch(() => {})
+                throw error
+            }
+        })
     }
 
     /* ------------------------------------------------------------------ 写入 */
@@ -248,7 +280,7 @@ export function createContent({ root, git: gitCommand = 'git', authorName = '助
             }
             if (edited.length > 0) {
                 await git(['add', '-A', '--', ...edited])
-                await git(['commit', '-q', `--author=${userName} <user@mind-framework.local>`, '-m', `用户编辑：${edited.join('、')}`, '--', ...edited])
+                await git(['commit', '-q', `--author=${OUTSIDE_AUTHOR}`, '-m', `工具外改动：${edited.join('、')}`, '--', ...edited])
             }
         }
 
@@ -318,7 +350,23 @@ export function createContent({ root, git: gitCommand = 'git', authorName = '助
     /** 准备好内容库（不是仓库就建一个、写起步模板）：启动时调一次，不用等第一次写入。 */
     const prepare = () => serial(() => ensureRepository())
 
-    return Object.freeze({ read, list, write, prepare, root: base })
+    /**
+     * 文件每一行最后一次提交的时刻（毫秒，`git blame`）：便签按条给修改时间用。工作区里还没提交的行是 `null`
+     * （工具外的改动要等定时的 `sweep` 才提交）。文件不在 Git 里、或者 blame 失败，返回 `null`。
+     */
+    async function lineTimes(path) {
+        const result = await git(['blame', '--line-porcelain', '--', path], { allowFailure: true })
+        if (result.code !== 0) return null
+        const times = []
+        let uncommitted = false
+        for (const line of result.stdout.split('\n')) {
+            if (/^[0-9a-f]{40} \d+ \d+/.test(line)) uncommitted = /^0{40} /.test(line)
+            else if (line.startsWith('committer-time ')) times.push(uncommitted ? null : Number(line.slice('committer-time '.length)) * 1000)
+        }
+        return times
+    }
+
+    return Object.freeze({ read, list, write, sweep, prepare, lineTimes, root: base })
 }
 
 /** 结束整棵进程树：Windows 用 `taskkill /T /F`（趁外层还活着），别的系统发 SIGKILL。 */

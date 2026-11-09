@@ -3,7 +3,8 @@
  *
  * 附提醒：
  * - 不开一轮，下一轮交给模型；这一轮成功结束（`turn/end` 为 `completed`）而且模型确实跑过，才算交到、才撤掉。
- *   这一轮开始以后才附上的不算交到，留给下一轮。失败了留着，下一轮再交。
+ *   这一轮开始以后才附上的不算交到，留给下一轮；除非执行方是在那之后才来取的（`delivering`，比如这一轮排在交接整理后面），
+ *   那它已经交给模型了。失败了留着，下一轮再交。
  * - 存在核心自己的存储域里，Host 重启不丢；`onTaken` 只在内存里。
  * - 各执行方怎么交给模型（原生的段、Claude Code 的 `additionalContext`）由执行方按 `list` 取。
  *
@@ -89,6 +90,8 @@ export function createAttachments(domain, { readEvents, report, gatedFailure = a
     const attachments = () => domain.table('attachments')
     const failures = () => domain.table('failures')
     const takenCallbacks = new Map()
+    /** 执行方取走、这一轮要交给模型的提醒。 */
+    const handedOut = new Set()
     /** 每个会话每一轮领走的输入：`会话#轮` → [{ message, time }]。 */
     const claimed = new Map()
 
@@ -111,12 +114,17 @@ export function createAttachments(domain, { readEvents, report, gatedFailure = a
         return attachments().get(attachmentId(String(sessionId), key)) !== undefined
     }
 
-    /** 这个会话还没交到的提醒，按附上的先后。 */
-    function list(sessionId) {
+    /**
+     * 这个会话还没交到的提醒，按附上的先后。
+     * @param options.delivering - 执行方取了就要交给模型：这一轮结束时不管附上的时刻都算交到。
+     */
+    function list(sessionId, { delivering = false } = {}) {
         const id = String(sessionId)
-        return [...attachments().entries()].map(([, item]) => item).filter(item => item.sessionId === id)
+        const items = [...attachments().entries()].map(([, item]) => item).filter(item => item.sessionId === id)
             .sort((a, b) => a.at - b.at)
             .map(({ key, text, at }) => ({ key, text, at }))
+        if (delivering) for (const item of items) handedOut.add(attachmentId(id, item.key))
+        return items
     }
 
     function noteClaimed(sessionId, turn, message) {
@@ -160,8 +168,9 @@ export function createAttachments(domain, { readEvents, report, gatedFailure = a
             if (!modelRan(events, turn)) return
             const started = events.find(item => item?.type === 'turn/start' && item.data?.turn === turn)?.time ?? event.time
             for (const item of list(id)) {
-                if (item.at > started) continue
                 const key = attachmentId(id, item.key)
+                if (item.at > started && !handedOut.has(key)) continue
+                handedOut.delete(key)
                 await attachments().delete(key)
                 const callback = takenCallbacks.get(key)
                 takenCallbacks.delete(key)
